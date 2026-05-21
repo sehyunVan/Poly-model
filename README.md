@@ -231,7 +231,7 @@ poly-model/
 
 ## License
 
-Add a `LICENSE` file at the repo root before publishing (MIT recommended).
+MIT. Use it kindly.
 
 ---
 
