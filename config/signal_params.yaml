@@ -1,0 +1,36 @@
+# Signal generation parameters.
+# All values are loaded at runtime; no hardcoding in source files.
+
+# Alpha threshold (tau_alpha): minimum |P_R - P_M| required to generate a trade signal.
+# Signals with |alpha| <= this value are discarded as noise.
+alpha_threshold: 0.05
+
+# Minimum prediction confidence to allow a trade.
+# Below this value the model spread is too wide to act on.
+min_confidence: 0.20   # require at least some model agreement before acting
+
+# Minimum seconds remaining before market close.
+# Trades are blocked inside this window to avoid last-minute liquidity collapse.
+min_seconds_to_close: 3600   # 1 hour
+
+# Maximum seconds remaining before market close.
+# Markets closing further than this are skipped — avoids capital being locked
+# in long-term positions before the strategy is validated.
+# 2592000 = 30 days
+max_seconds_to_close: 2592000   # 30 days
+
+# base_size_factor scaling: full size (1.0) is reached when |alpha| >= this value.
+alpha_full_size: 0.20
+
+# Pre-trade orderbook / liquidity filters applied before signal generation.
+pre_trade_filters:
+  min_volume_24h: 1000.0    # USDC — minimum 24-hour traded volume
+  max_volume_24h: 50000.0   # USDC — skip high-volume markets where professionals dominate
+                            # (edge only exists in inefficient thin markets)
+  max_spread: 0.03          # maximum allowed bid-ask spread (3 percentage points)
+  min_book_depth_usdc: 100.0  # minimum total liquidity on best bid + ask level
+  # Market price bounds: skip extreme long-shots and near-certainties.
+  # The bootstrap-contaminated model generates spuriously large alpha on these,
+  # and they carry unlimited downside for YES bets near 0.
+  min_market_price: 0.08    # skip markets where YES < 8%
+  max_market_price: 0.92    # skip markets where YES > 92%

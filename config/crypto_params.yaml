@@ -1,0 +1,252 @@
+# Crypto loop trading parameters.
+# All values are loaded at startup; changes take effect on next restart.
+
+# Timeframe identifier — used in slug construction and settlement.
+# 5m loop uses "5m" (300s windows). See crypto_15m_params.yaml for 15m.
+timeframe: "5m"
+window_seconds: 300
+
+# Main loop interval in seconds between cycles.
+loop_interval: 20
+
+# Entry window: only enter a position when the market window has been open
+# for at least min_window_elapsed seconds (price has had time to form).
+# ★ REVERTED 150 → 200 (2026-05-11): tighten back to doc baseline. The widening
+#   to 150 (2026-05-07) was part of the "more activity" push; recent perf shows
+#   the wider window contributed to the all-time -$112.94 bleed.
+min_window_elapsed: 200
+
+# Stop entering after max_window_elapsed seconds into the 5-minute window.
+# Community research: ~15-20% of windows resolve in final 10s.
+# ★ REVERTED 280 → 270 (2026-05-11): tighten back to doc baseline.
+max_window_elapsed: 270
+
+# Fractional Kelly multiplier for position sizing.
+kelly_fraction: 0.50
+
+# Maximum fraction of available capital per trade.
+# Set to 0.15 for small balance (~$21) so bets reach the minimum.
+# At $200+ balance, reduce back to 0.04.
+# ★ REDUCED 2026-05-06: wallet >$200 triggers scaling rule. 0.15×$119=$17.85 was too large;
+#   reduced to 0.04 → $4.76/trade, matching the profitable May 2-3 bet size regime.
+max_bet_pct: 0.04
+
+# Hard cap per trade in USDC (absolute).
+# ★ Phase 3 confirmed 2026-04-20: 975 BTC labeled rows (>500 threshold), user approved.
+# ★ REVERTED 20 → 10 (2026-05-11): tighten to Phase 3 doc max. The $20 cap was
+#   beyond the documented scaling path and amplified May 4-style drawdowns.
+max_bet_abs: 10.0
+
+# Wallet budget split — crypto loop only uses this fraction of total CLOB balance.
+# Remaining fraction is reserved for the swarm bot.
+# 0.50 = crypto gets max 50%, swarm gets max 50%.
+wallet_share: 0.50
+
+# Minimum trade size in USDC; smaller bets are skipped.
+# ★ LOWERED 0.5 → 0.20 (2026-05-13): fix the "bet too small" skip that blocks trades.
+#   With $7.32 wallet and variable sizing producing $0.20-0.30 bets, the $0.50 floor
+#   was below minimum available. Lowering to $0.20 allows profitable low-conviction
+#   signals to execute. At $5 avg bet this is 4% position size — acceptable risk.
+min_bet_abs: 0.20
+
+# Inverse-fill weight floor — code default is 0.5 (50% shrink at fill 0.80).
+# ★ REVERTED 1.0 → 0.5 (2026-05-11): restore default bet-shrinking behavior.
+inverse_fill_weight_min: 0.5
+
+# CLOB ask price band — RE-ENABLED 2026-04-27 after filter removal test.
+# Band [0.75-0.80] is the doc-validated profitable zone (+$0.12 EV/trade).
+# Extreme prices (0.01, 0.95+) have zero orderbook depth and fail to fill.
+# ★ REVERTED 0.68-0.84 → 0.75-0.80 (2026-05-11): tighten back to doc baseline.
+#   The 2026-05-07 widening exposed the bot to -EV zones and contributed to
+#   the all-time -$112.94 bleed. [0.72-0.75) was -$0.242 avg, [0.80-0.84) -EV.
+# ★ TRADE FREEZE 2026-05-14: max_clob_price set to 0.0 (impossible band) so no
+#   signal ever passes _in_clob_band(). Loop stays alive, AR (auto-redeem) keeps
+#   running every 12h. To re-enable trading, restore max_clob_price to 0.80.
+min_clob_price: 0.75
+max_clob_price: 0.0
+clob_zone2_min: 0.0
+clob_zone2_max: 0.0
+
+# Upper band score floor — RE-ENABLED 2026-05-11 (revert to doc baseline).
+# Low-score signals at expensive fills have negative EV; |score|>=0.45 required
+# above upper_band_start. EV=+0.079 for |score|>=0.45+trend!=UP at [0.80-0.90).
+upper_band_start: 0.80
+upper_band_min_score: 0.45
+
+# Polymarket CLOB taker fee rate applied to every virtual fill.
+fee_rate: 0.02
+
+# Minimum number of labeled rows in crypto_cache.jsonl before nightly
+# retraining is triggered.
+retrain_min_rows: 30
+
+# Virtual portfolio budget (used only when creating a fresh state file).
+virtual_budget: 1000.0
+
+# C2: daily loss circuit breaker — halt new trades when realized + unrealized
+# loss for the day exceeds this fraction of the day's starting capital.
+# ★ RE-ENABLED 2026-05-11: 0.30 = halt at 30% daily drawdown. Critical safety
+#   net was disabled 2026-05-07 with "accept full bleed risk" — restoring it.
+daily_loss_limit_pct: 0.30
+
+# Ghost contrarian tracker: log hypothetical contrarian bets in [ghost_band_min, min_clob_price).
+# Tracks [0.70–0.72) now that 0.72–0.74 is opened. [0.70-0.72] was -10.8% edge, keep watching.
+ghost_band_min: 0.70
+# Upper ghost band: log signal-following observations when fill > max_clob_price and <= ghost_upper_max.
+# [0.90–0.95]: 4.9% signal edge in signal_log (118 entries) — accumulating real data before opening.
+ghost_upper_max: 0.95
+
+# Score cap: skip if |score| >= max_signal_score (crowd already certain at high
+# scores → fills too expensive, EV -3% to -11%).
+# ★ REMOVED 2026-05-13: DATA REFUTATION — conviction analysis on 7,862 executed/settled
+#   trades shows LOW conviction [0.00-0.25) produces $12.90/trade, while EXTREME [0.65+)
+#   produces $0.11/trade. Current cap REMOVES the most profitable trades. Setting to 1.5
+#   (exceeds max possible 1.0) to allow all conviction levels. Low conviction = wider
+#   information gap = tradeable edge.
+max_signal_score: 1.5
+
+# ── Fade mode (added 2026-05-07) ──────────────────────────────────────────────
+# When the crowd is over-committed (high |score|, late in window, expensive
+# signal-side fill), buy the OPPOSITE (cheap) token at a small bet. Asymmetric
+# payout: pay $0.10–0.30 to win $0.70–0.90 means breakeven WR is only ~25%.
+# Hypothesis: late-window blowoffs reverse more often than retail thinks.
+# Conservative initial deployment — small bet cap, validate before scaling.
+fade_mode_enabled:        false   # ★ DISABLED 2026-05-14 (trade freeze for AR-only mode)
+fade_score_threshold:     0.80    # |score| must be >= this to trigger fade (★ REVERTED 0.60→0.80 on 2026-05-11 — back to doc baseline)
+fade_min_window_elapsed:  240.0   # only fade in last 60s of the 300s window
+fade_min_signal_fill:     0.78    # only fade when signal-side clob_ask is genuinely expensive
+fade_band_min:            0.10    # cheap-side band lower bound
+fade_band_max:            0.30    # cheap-side band upper bound
+fade_max_bet_abs:         1.50    # hard cap for fade bets (small while validating)
+
+# Session filter: only enter new positions during proven profitable UTC hours.
+# Analysis of 423 real trades (2026-03-29):
+#   10:00 UTC: +$23.62  WR=82.4%  edge=+11.3%  ✅ BEST
+#   16:00 UTC:  +$9.53  WR=81.8%  edge=+8.9%   ✅ GOOD
+#   11:00 UTC:  -$3.99  WR=72.5%  edge=+0.6%   ❌ marginal, blocked
+#   12:00 UTC:  -$7.77  WR=66.7%  edge=-6.2%   ❌ (ETH 12:00 = -$20.19)
+#   13:00 UTC:  -$3.63  WR=73.3%  edge=-0.8%   ❌ (ETH 13:00 = -$13.22)
+#   17:00 UTC:  -$9.54  WR=61.5%  edge=-12.5%  ❌ losing, now blocked
+#   14–15 UTC: losing (already blocked)
+# Session filter: trade 24/7 with new filters doing the quality gating.
+# Old hour blocks were based on pre-filter data (ETH mixed in, wide band, early entry).
+# With BTC-only + 0.74-0.76 band + WS confirmation + 200-270s window,
+# the filters are strong enough — let them decide, not the clock.
+# Only keeping the hard Asian session block (05:00 UTC: -$22.74 on 34 trades,
+# worst hour by far, consistent across both symbols).
+trade_hour_start: 0
+trade_hour_end: 24
+# ★ RE-ENABLED 2026-05-11: tighten back to doc baseline.
+# UTC 00,01 (post-midnight), 02 (58%WR n=12), 05 (64%WR n=14), 06 (65%WR n=20)
+# all below the 72% breakeven for [0.75-0.80) fills.
+trade_hour_block: [0, 1, 2, 5, 6]
+
+# ETH hour block — ★ RE-ENABLED 2026-05-11: doc baseline.
+# ETH 67% WR, -$13.98 consistent drag. All hours blocked until ETH proves itself.
+eth_hour_block: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+# Symbols to trade — ★ REVERTED 2026-05-11: BTC-only per doc baseline.
+# ETH and SOL filters in eth_hour_block / sol_hour_block additionally block them.
+active_symbols: [BTC]
+
+# SOL-specific hour block (UTC). ★ RE-ENABLED 2026-05-11: full block (44% WR May 4).
+sol_hour_block: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+
+# 1-minute Binance spot confirmation filter:
+# Before entering, require that the 1-min Binance return agrees with signal direction.
+# Threshold: spot must have moved at least this much in signal direction in past 1 min.
+# 0.0005 = 0.05% — a small but confirmed move. Set 0 to disable.
+binance_1m_confirm_pct: 0.0   # disabled 2026-04-13: 113 blocks with no documented WR basis, set 0.0002 to re-enable
+
+# Variable bet sizing — ★ RE-ENABLED 2026-05-11: doc baseline 0.60.
+# Weakest signal = 60% of max_bet_abs; strongest = 100%. Combined w/ ML prob.
+min_sizing_pct: 0.60
+
+# Mid-window profit-taking exit.
+# When an owned token's CLOB ask reaches this price, place a SELL to lock in gains.
+# Disabled by default — enable after validating with crypto15 virtual loop (50+ exits).
+mid_exit_enabled: false
+mid_exit_price_threshold: 0.88   # sell when ask >= 0.88 (from typical entry ~0.75 → 52% of max gain)
+
+# ML entry filter — two modes, both disabled until model is retrained.
+#
+# Legacy classifier (old model, objective != "epnl"):
+#   ml_filter_threshold: 0.65  → enter only when P(win) >= 0.65
+# ★ RE-ENABLED 2026-05-11: doc baseline. +2.7pp WR lift on 289 BTC in-band trades.
+ml_filter_threshold: 0.65
+#
+# EV regressor (new model, objective == "epnl"):
+#   ml_epnl_threshold: 0.02  → enter only when predicted EV/dollar >= 0.02
+#   Set to 0.0 to take all trades with positive predicted EV.
+#   Omit this key entirely to keep the EV filter disabled.
+ml_epnl_threshold: 0.00   # take all trades with positive predicted EV (walk-forward optimum 2026-04-28)
+
+# Force-UP hours (UTC): in these hours the market goes UP at a structurally higher
+# rate regardless of signal direction.  DOWN signals are overridden to UP.
+# DISABLED 2026-05-07 after empirical refutation on signal_log (7,734 settled signals,
+# 268 deduped UTC-23 windows): UTC 23 actual UP-resolution rate is 41.4% — UTC 23 is
+# in fact one of the most DOWN-biased hours.  YES at UTC 23: 40.5% WR / -$398.55 PnL
+# (n=274).  NO at UTC 23: 70.4% WR / +$13,684 (n=108).  The original 86.2% n=94 claim
+# does not hold up at scale.  Override also conflicted with SPOT_TREND_FILTER (forced
+# UP then trend-killed when 15m trend was non-NEUTRAL).
+force_up_hours_utc: []
+
+# Spot trend filter — RE-ENABLED 2026-05-05.
+# Test confirmed: non-NEUTRAL days (UP/DOWN trend) have 49-54% WR vs NEUTRAL 79% WR.
+# May 4 live data: 44% WR overall, YES WR 31% on a DOWN-trend day without this filter.
+# Blocks 14.7% of trades but removes negative-EV signals. Net effect: positive.
+spot_trend_filter: true   # ★ RE-ENABLED 2026-05-11: doc baseline. Non-NEUTRAL has 49-54% WR vs NEUTRAL 79%.
+
+# Cross-asset pairs signal: BTC/ETH/SOL momentum-transfer filter.
+# When one asset (leader) surges and another (target) lags, the target tends
+# to follow within minutes. pairs_filter_enabled=false → log-only mode (default).
+# Enable after 100+ log entries confirm divergence→direction correlation is real.
+#
+# pairs_disagree_block=true: when pairs signal conflicts with flow signal, skip.
+# pairs_agree_boost=1.15: when pairs confirms flow, increase bet by up to 15%.
+# pairs_window_sec=60: compare 60-second returns across assets.
+# pairs_min_divergence=0.002: 0.20% gap needed to emit a directional signal.
+pairs_filter_enabled: false
+pairs_agree_boost: 1.15
+pairs_disagree_block: true
+pairs_window_sec: 60.0
+pairs_min_divergence: 0.002
+
+# Contrarian mode: buy the opposite token from the signal.
+# Used by the 15m loop — see crypto_15m_params.yaml.
+contrarian_mode: false
+
+# Liquidation cascade filter: Binance forced-order WS signal.
+# Large cascades (>$10M in 15s) continue in that direction ~70% of the time
+# for the next 2-5 min. Enable after accumulating 50+ events in signal_log.
+# cascade_filter_enabled=false → log-only mode (same pattern as pairs signal).
+# cascade_agree_boost=1.25: boost bet 25% when cascade confirms flow direction.
+# cascade_disagree_block=true: skip trade when cascade opposes flow direction.
+cascade_filter_enabled: false
+cascade_agree_boost: 1.25
+cascade_disagree_block: true
+
+# ── Settlement arb (src/settle_arb_main.py) ───────────────────────────────────
+# Acts at elapsed 272-290s — AFTER the main loop's entry window closes (200-270s).
+# Pure oracle math: if Chainlink drift from window open is clear, buy winning token
+# if the CLOB hasn't fully priced it in yet. No flow signal used.
+# Run: screen -S settle_arb → python src/settle_arb_main.py >> logs/settle_arb.log 2>&1
+settle_arb_enabled: true         # ★ RE-ENABLED 2026-05-20 (paper-mode revival; new calibration)
+settle_arb_max_ask: 0.95         # ★ 0.92→0.95: more entries pass the cap
+settle_arb_min_ask: 0.20         # ★ 0.10→0.20 (2026-05-20 v2): 3/8 paper losses at ask≤0.20 were extreme-move reversions; raise the floor
+settle_arb_min_payout: 0.04      # ★ 0.06→0.04: smaller required net edge (paper-validate first)
+settle_arb_bet_abs: 1.0          # ★ 3.0→1.0: paper bet size while edge is unconfirmed
+# Settle-arb runs on BTC/ETH/SOL independent of the crypto loop's `active_symbols`
+# (which is still [BTC] from the 2026-05-11 reconciliation).
+settle_arb_symbols: [BTC, ETH, SOL]
+# Multi-timeframe scan. Drift accumulates more in longer windows so we can
+# capture signals even in current low-vol regime where 5m windows rarely
+# generate ≥0.07% drift. Per-tf action params defined in code's _TIMEFRAMES.
+settle_arb_timeframes: [5m, 15m, 1h]
+# 5m calibration (legacy keys — no _5m_ suffix for backwards compat):
+settle_arb_start_elapsed: 285    # ★ act in last 15s
+settle_arb_end_elapsed: 295      # ★ before 5s safety margin
+settle_arb_min_drift: 0.0005     # ★ 0.07%→0.05%: aggressive; tests low-drift edge in current vol regime
+# 15m / 1h overrides (defaults in code are usable; uncomment to tune):
+# settle_arb_15m_min_drift: 0.0010
+# settle_arb_1h_min_drift: 0.0020

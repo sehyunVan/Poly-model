@@ -1,0 +1,40 @@
+# Crypto-strike lottery scanner parameters.
+#
+# Scans Polymarket Gamma for markets like:
+#   "Will Bitcoin reach $95,000 in May?"
+#   "Will the price of Bitcoin be above $84,000 on May 7?"
+# Identifies long-shots (px <= max_ticket_price) where a Black-Scholes-style
+# digital-option estimate disagrees with market odds, OR where Binance shows
+# momentum continuation toward the strike (burst mode).
+
+loop_interval:       90       # seconds between scans
+market_cache_ttl:    300      # refresh Gamma market list every N seconds
+min_volume_24h:      2000     # ★ LOWERED 5000 → 2000 (2026-05-07): more candidates
+min_ticket_price:    0.02     # below this the orderbook is empty / unfillable
+max_ticket_price:    0.45     # ★ RAISED 0.30 → 0.45 (2026-05-07): more candidates per scan
+ticket_size_usdc:    1.0      # flat $1 per lottery ticket
+daily_spend_cap:     15.0     # ★ RAISED 10 → 15 (2026-05-07): more bets/day
+edge_threshold:      0.02     # ★ LOWERED 0.03 → 0.02 (2026-05-07): more model fires
+
+# Annualised vol estimates per asset (used by digital-option pricer).
+# Tuned for "fast" expiries — these decay quickly, so vol estimate dominates.
+volatility_btc:      0.60
+volatility_eth:      0.80
+volatility_sol:      1.00
+volatility_xrp:      0.80
+volatility_doge:     1.20
+
+# Burst mode: when an asset moves fast, bet nearby strikes that just became achievable.
+burst_enabled:           true
+burst_lookback_min:      30       # window for momentum check
+burst_min_move_pct:      0.010    # ★ LOWERED 0.015 → 0.010 (2026-05-07): fires on 1% moves
+burst_max_strike_gap:    0.06     # ★ RAISED 0.04 → 0.06 (2026-05-07): widen burst reach
+
+# Minimum hours-to-resolve. Below this, fills are too volatile and ask gaps too thin.
+min_hours_to_close:  0.5
+# Maximum hours-to-resolve. Above this, time decay is irrelevant; tickets sit forever.
+max_hours_to_close:  168          # 1 week max
+
+# Mode: when true, log proposed bets but do not place them.
+# Override at runtime via STRIKE_VIRTUAL_MODE env var.
+virtual_mode:        false

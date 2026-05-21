@@ -1,0 +1,129 @@
+# 15-minute BTC/SOL up/down market parameters.
+# All values loaded at startup by crypto_15m_main.py via CRYPTO_CONFIG_FILE env var.
+# Performance data accumulates in data/crypto_15m_cache.jsonl.
+# Start in VIRTUAL mode; go live after 100+ trades at >= 65% WR.
+
+# ── Timeframe ─────────────────────────────────────────────────────────────────
+timeframe: "15m"
+window_seconds: 900   # 15 minutes
+
+# ── Loop timing ───────────────────────────────────────────────────────────────
+loop_interval: 60   # poll every 60s (vs 20s for 5m — window is 3x longer)
+
+# Entry window: LATE-WINDOW CONVERGENCE — enter in the last 30–100s of the 900s window.
+# Rationale (from empirical analysis of external 15m bots + our own data):
+#   At 600-780s (prior setting), 2-5 min remain and BTC can still reverse 0.3-0.8%.
+#   At 800-870s, only 30-100s remain — near-equivalent to 5m's 30-100s residual.
+#   Market consensus is already locked in; we confirm, not predict.
+min_window_elapsed: 800   # 89% of 900s — crowd has fully committed
+max_window_elapsed: 870   # 97% of 900s — stop with 30s to go (spread widens at close)
+
+# ── Signal ────────────────────────────────────────────────────────────────────
+# drift_scale: how many cents of UP token price movement = score ±1.0.
+# 5m uses 0.06 (6 cents). For 15m the observation window is ~510s vs ~205s
+# for 5m, so price drifts further before entry. 0.15 keeps drift_score in a
+# useful dynamic range rather than immediately clamping to ±1.0.
+drift_scale: 0.15
+
+# ── Position sizing ───────────────────────────────────────────────────────────
+kelly_fraction: 0.50
+max_bet_pct: 0.15         # small balance early; reduce to 0.04 at $200+
+max_bet_abs: 5.0          # Phase 1: cap at $5 until 100 in-band trades
+min_bet_abs: 0.5
+
+# Wallet share reserved for this loop (separate from the 5m loop's 50%).
+# 15m uses its own CLOB balance slice — set to 1.0 until 15m is proven, then
+# coordinate with 5m loop operator to avoid double-spending the same budget.
+# NOTE: in virtual mode wallet_share has no effect (no real CLOB balance).
+wallet_share: 0.50
+
+min_sizing_pct: 0.60   # variable sizing: weakest signal = 60% of max_bet_abs
+
+# ── CLOB price band ───────────────────────────────────────────────────────────
+# Band filter DISABLED 2026-05-01: accumulate data at all fill prices.
+# Not enough history to know which fill zones are profitable for 15m late-window entry.
+# Ghost bands still log [0.70, min_clob_price) and (max_clob_price, 0.95].
+min_clob_price: 0.75
+max_clob_price: 0.88
+clob_zone2_min: 0.75
+clob_zone2_max: 0.80
+upper_band_start: 1.0
+upper_band_min_score: 0.0
+band_filter_enabled: false
+
+# Score cap and floor — same as 5m
+max_signal_score: 0.65
+
+# ── Fees and risk ─────────────────────────────────────────────────────────────
+fee_rate: 0.02
+daily_loss_limit_pct: 0.30
+
+# ── Ghost data collection ─────────────────────────────────────────────────────
+ghost_band_min: 0.70
+ghost_upper_max: 0.95
+
+# ── Session filter ────────────────────────────────────────────────────────────
+trade_hour_start: 0
+trade_hour_end: 24
+trade_hour_block: [0, 1, 2, 5, 6]  # Same bad UTC hours as 5m — avoid low-WR sessions
+
+# ETH disabled (same as 5m — thin liquidity). BTC + SOL only.
+eth_hour_block: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+sol_hour_block: []         # SOL trades all hours
+active_symbols: [BTC, SOL]
+
+# Force-UP hour: disabled — not validated for late-window 15m entry. Re-enable after 100+ clean trades.
+force_up_hours_utc: []
+
+# ── ML filter ─────────────────────────────────────────────────────────────────
+ml_filter_threshold: 0.0    # disabled: no 15m-specific model exists yet; train after 300+ clean labeled trades
+binance_1m_confirm_pct: 0.0
+
+# Spot trend filter enabled — block ALL non-NEUTRAL (same as 5m).
+# signal_log analysis (243 executed+settled 2026-04-22):
+# NEUTRAL: 79% WR | UP: 61% WR | DOWN: 65% WR
+# Even trend-AGREEING bets underperform; filter blocks all non-NEUTRAL.
+spot_trend_filter: true
+
+# ── Contrarian mode ───────────────────────────────────────────────────────────
+# DISABLED 2026-04-29: contrarian produced 48.8% WR (281 settled, last 7d) — random.
+# Hypothesis failed at scale: signal inversion adds no edge on 15m markets.
+# Momentum-follow (same as 5m) starting fresh. Old cache renamed to *_contrarian_bak.jsonl.
+contrarian_mode: false
+
+# ── Liquidation cascade filter ────────────────────────────────────────────────
+# Binance forced-order WS signal. Log-only initially; enable after 50+ events.
+cascade_filter_enabled: false
+cascade_agree_boost: 1.25
+cascade_disagree_block: true
+
+# ── Pairs signal (cross-asset momentum) ───────────────────────────────────────
+# Log-only initially.
+pairs_filter_enabled: false
+pairs_agree_boost: 1.15
+pairs_disagree_block: true
+pairs_window_sec: 60.0
+pairs_min_divergence: 0.002
+
+# ── Direction filter ─────────────────────────────────────────────────────────
+# Cleared — contrarian_mode: true already flips the direction for every trade.
+# force_direction + contrarian_mode would fight each other.
+force_direction: ""
+
+# ── Separate data files ───────────────────────────────────────────────────────
+# These files are completely isolated from the 5m loop's files.
+cache_file: "crypto_15m_cache.jsonl"
+log_file: "crypto_15m.log"
+state_file_virtual: "15m_virtual_state.json"
+state_file_live: "15m_real_state.json"
+
+# ── Retraining ────────────────────────────────────────────────────────────────
+retrain_min_rows: 30
+virtual_budget: 1000.0
+
+# ── Mid-window profit-taking exit ─────────────────────────────────────────────
+# DISABLED 2026-04-27: unvalidated feature that may trigger prematurely.
+# Reverting to hold-to-resolution (same as 5m) for consistency.
+# Enable only after 50+ validated exits show positive delta vs baseline.
+mid_exit_enabled: false
+mid_exit_price_threshold: 0.88   # unused when disabled

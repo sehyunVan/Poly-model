@@ -1,0 +1,91 @@
+# "1h" data collector — repurposed 2026-04-23.
+# Polymarket has no 1h markets. This loop now targets 5m markets with ALL
+# session filters removed, collecting data for hours and trends the live
+# loop blocks. Purpose: answer "what would have happened without hour/trend filters?"
+# Entry point: src/crypto_1h_main.py
+
+# ── Timeframe (redirected to 5m markets) ─────────────────────────────────────
+timeframe: "5m"
+window_seconds: 300
+loop_interval: 20         # same cadence as live 5m loop
+
+# Same proportional entry window as live loop.
+min_window_elapsed: 200
+max_window_elapsed: 270
+
+# ── Signal ────────────────────────────────────────────────────────────────────
+drift_scale: 0.06         # 5m scale (same as live loop)
+
+# ── Position sizing ───────────────────────────────────────────────────────────
+kelly_fraction: 0.50
+max_bet_pct: 0.25         # increased from 0.15 — 91.7% WR allows larger sizing
+max_bet_abs: 5.0
+min_bet_abs: 0.5
+wallet_share: 0.50
+min_sizing_pct: 0.60
+
+# ── CLOB price band — OPENED for data collection 2026-04-28 ──────────────────
+# n=48 is too small to optimize. Removing band and score cap to accumulate
+# data across all fill zones. Watch what zones emerge naturally.
+min_clob_price: 0.50
+max_clob_price: 0.99
+clob_zone2_min: 0.50
+clob_zone2_max: 0.99
+upper_band_start: 0.99
+upper_band_min_score: 0.0
+max_signal_score: 1.0
+
+# ── Fees and risk ─────────────────────────────────────────────────────────────
+fee_rate: 0.02
+daily_loss_limit_pct: 0.30
+
+# ── Ghost data ────────────────────────────────────────────────────────────────
+ghost_band_min: 0.70
+ghost_upper_max: 0.95
+
+# ── Session filter — ALL REMOVED for data collection ─────────────────────────
+trade_hour_start: 0
+trade_hour_end: 24
+trade_hour_block: []       # no blocking — collect data from all hours
+eth_hour_block: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+sol_hour_block: []         # SOL trades all hours
+active_symbols: [BTC, SOL]
+force_up_hours_utc: [23]
+
+# ── Direction filter ─────────────────────────────────────────────────────────
+# Open both directions — need data across UP and DOWN to understand the pattern.
+# 48-trade YES edge could be noise. Let signal determine direction freely.
+force_direction: ""
+
+# Spot trend filter DISABLED — collect data across all trend conditions.
+# This is the key difference from the live loop: captures UP/DOWN trend trades
+# that the live loop skips (live: NEUTRAL 79% WR vs UP 61%, DOWN 65%).
+spot_trend_filter: false
+
+# ── ML filter ─────────────────────────────────────────────────────────────────
+ml_filter_threshold: 0.0
+binance_1m_confirm_pct: 0.0
+
+# ── Liquidation cascade filter ────────────────────────────────────────────────
+# Binance forced-order WS signal. Log-only initially; enable after 50+ events.
+cascade_filter_enabled: false
+cascade_agree_boost: 1.25
+cascade_disagree_block: true
+
+# ── Pairs signal (cross-asset momentum) ───────────────────────────────────────
+# Log-only initially.
+pairs_filter_enabled: false
+pairs_agree_boost: 1.15
+pairs_disagree_block: true
+pairs_window_sec: 60.0
+pairs_min_divergence: 0.002
+
+# ── Separate data files ───────────────────────────────────────────────────────
+cache_file: "crypto_1h_cache.jsonl"
+log_file: "crypto_1h.log"
+state_file_virtual: "1h_virtual_state.json"
+state_file_live: "1h_real_state.json"
+
+# ── Retraining ────────────────────────────────────────────────────────────────
+retrain_min_rows: 30
+virtual_budget: 1000.0

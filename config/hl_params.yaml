@@ -1,0 +1,82 @@
+# Hyperliquid perpetual trading parameters.
+# Loaded at startup — changes take effect on next restart.
+#
+# Strategy: use Polymarket 5-min BTC flow signal as entry trigger for
+# leveraged BTC-USD-PERP positions on Hyperliquid.
+# Same signal, larger position size, separate capital pool.
+
+# Loop interval in seconds (matches crypto loop cadence).
+loop_interval: 20
+
+# Cross-margin leverage applied to each position.
+# 3x = $50 notional controls $150 exposure.
+# Do NOT exceed 5x without re-evaluating liquidation risk.
+leverage: 3
+
+# Take-profit: close position when price moves this far in our favour.
+# 0.0012 = 0.12%  → 3:1 R:R vs SL. Break-even WR = 25% (current WR ~36%).
+# Was 0.0008 (2:1). Changed 2026-04-02 after 199 trades at 36.2% WR.
+tp_pct: 0.0012
+
+# Stop-loss: close position when price moves this far against us.
+# 0.0004 = 0.04%  (~$27 at BTC=$68k)
+sl_pct: 0.0004
+
+# Maximum USDC notional per single position (pre-leverage).
+# E.g. 5.0 → opens a $15 leveraged position on a $5 margin deposit.
+# ★ lowered from 50.0 → 5.0 (2026-04-12): starting with $15 HL balance.
+# Raise to 50.0 once balance reaches $150+.
+max_position_usdc: 5.0
+
+# Never hold more than this many simultaneous HL positions.
+max_open_positions: 2
+
+# Force-close any position open longer than this many seconds.
+# 240 s = 4 min — Polymarket window is 5 min, so we're out before resolution.
+max_hold_seconds: 240
+
+# Minimum Polymarket flow score required to open an HL position.
+# Stricter than Polymarket's 0.25 threshold — perp risk demands higher conviction.
+signal_threshold_for_hl: 0.35
+
+# Daily loss circuit breaker: halt HL trading when today's HL-only realized
+# PnL falls below this fraction of the day's starting capital.
+# 0.20 = stop after losing 20% of HL starting balance in one day.
+daily_loss_limit_pct: 0.20
+
+# Starting USDC balance for paper-trading mode (virtual only).
+virtual_budget: 1000.0
+
+# ── Funding rate signal (Signal 6) ────────────────────────────────────────────
+# Threshold in per-8h funding rate units.
+# |funding| > this value → generate a fade-the-crowd contrarian score.
+# 0.0005 = 0.05% per 8h.  Typical: 0.01–0.05%; extreme: >0.1%.
+funding_fade_threshold: 0.0005
+
+# ── Liquidation imbalance signal (Signal 5) ───────────────────────────────────
+# Look back this many seconds for recent liquidation events on Hyperliquid.
+liq_lookback_seconds: 60
+
+# Ignore liq signal when total liquidation notional in window < this USD amount.
+# Prevents noise from tiny individual liquidations.
+liq_min_notional: 10000
+
+# ── Multi-asset config ────────────────────────────────────────────────────────
+# Symbols traded via Polymarket flow signal (BTC + ETH have 5-min PM markets).
+# BTC + ETH excluded 2026-04-11: ~$0.81 combined PnL on 637 trades — no meaningful edge.
+# SOL + AVAX (breakout path) generated $76.95 of $77.76 total PnL.
+hl_poly_symbols: []
+
+# Symbols traded via pure breakout scanner only (no Polymarket market exists).
+# Entry when |breakout_score| > breakout_entry_threshold; direction follows score sign.
+hl_breakout_symbols: [SOL, AVAX]
+
+# Minimum |breakout_score| to enter a pure-breakout trade.
+# Same scale as chop filter (0.20). Set higher (0.35) for breakout-only since
+# there's no Poly flow signal to confirm — need stronger conviction.
+breakout_entry_threshold: 0.35
+
+# ── Environment variable names (for reference, set in .env) ──────────────────
+# HL_ADDRESS : Hyperliquid wallet address (0x...)
+# HL_KEY     : Private key for signing HL orders
+# HL_VIRTUAL_MODE : "true" (default) | "false" to go live

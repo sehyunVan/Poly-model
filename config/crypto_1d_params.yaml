@@ -1,0 +1,87 @@
+# Shadow data collector — 5m markets, SPOT TREND FILTER OFF, all other filters live-identical.
+# Purpose: isolate the trend filter's contribution to edge.
+# Experiment design:
+#   live 5m   (all filters ON)          → ~79% WR  [benchmark]
+#   1d shadow (trend filter OFF only)   → ?  WR    [trend filter contribution = live_WR - shadow_WR]
+#   1h shadow (ALL filters OFF)         → ~50% WR  [total filter contribution]
+# From those three: trend alone = live - 1d; hour+ML = 1d - 1h
+# Entry point: src/crypto_1d_main.py
+
+# ── Timeframe (redirected to 5m markets) ─────────────────────────────────────
+timeframe: "5m"
+window_seconds: 300
+loop_interval: 20           # same cadence as live 5m loop
+
+min_window_elapsed: 200     # same entry window as live
+max_window_elapsed: 270
+
+# ── Signal ────────────────────────────────────────────────────────────────────
+drift_scale: 0.06           # 5m scale — identical to live
+
+# ── Position sizing ───────────────────────────────────────────────────────────
+kelly_fraction: 0.50
+max_bet_pct: 0.15
+max_bet_abs: 5.0
+min_bet_abs: 0.5
+wallet_share: 0.50
+min_sizing_pct: 0.60
+
+# ── CLOB price band — identical to live 5m ───────────────────────────────────
+min_clob_price: 0.75
+max_clob_price: 0.90
+clob_zone2_min: 0.75
+clob_zone2_max: 0.80
+upper_band_start: 0.80
+upper_band_min_score: 0.45  # [0.80-0.90) requires |score| >= 0.45
+max_signal_score: 0.65      # score cap — identical to live
+
+# ── Fees and risk ─────────────────────────────────────────────────────────────
+fee_rate: 0.02
+daily_loss_limit_pct: 0.30
+
+# ── Ghost data ────────────────────────────────────────────────────────────────
+ghost_band_min: 0.70
+ghost_upper_max: 0.95
+
+# ── Session filters — identical to live EXCEPT spot_trend_filter ──────────────
+trade_hour_start: 0
+trade_hour_end: 24
+trade_hour_block: [0, 1, 2, 5, 6]   # same blocked hours as live
+eth_hour_block: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23]
+sol_hour_block: []
+active_symbols: [BTC, SOL]
+force_up_hours_utc: [23]
+
+# ★ KEY DIFFERENCE: trend filter OFF — this is the variable being tested.
+# Live loop blocks ALL non-NEUTRAL (UP=61%WR, DOWN=65%WR vs NEUTRAL=79%WR).
+# This shadow loop trades through UP and DOWN trends — measures the WR gap.
+spot_trend_filter: false
+
+# ── ML filter — identical to live ────────────────────────────────────────────
+ml_filter_threshold: 0.65
+binance_1m_confirm_pct: 0.0
+
+# ── Liquidation cascade / pairs — log-only ────────────────────────────────────
+cascade_filter_enabled: false
+cascade_agree_boost: 1.25
+cascade_disagree_block: true
+
+pairs_filter_enabled: false
+pairs_agree_boost: 1.15
+pairs_disagree_block: true
+pairs_window_sec: 60.0
+pairs_min_divergence: 0.002
+
+# ── Direction filter ──────────────────────────────────────────────────────────
+force_direction: ""
+contrarian_mode: false
+
+# ── Separate data files ───────────────────────────────────────────────────────
+cache_file: "crypto_1d_cache.jsonl"
+log_file: "crypto_1d.log"
+state_file_virtual: "1d_virtual_state.json"
+state_file_live: "1d_real_state.json"
+
+# ── Retraining ────────────────────────────────────────────────────────────────
+retrain_min_rows: 30
+virtual_budget: 1000.0

@@ -1,0 +1,47 @@
+# 카테고리별 앙상블 가중치
+# baseline + tree + llm_text 합계가 1.0이어야 한다.
+#
+# llm_text 는 TextFeatures.llm_intuition_score 를 직접 사용하는 가중치다.
+# (별도 모델이 아니라 텍스트 피처의 한 값을 직접 반영)
+#
+# 조정 가이드:
+#   - 데이터가 많고 모델 성능이 좋으면 llm_text 비중을 낮춘다.
+#   - 텍스트 정보가 결정적인 카테고리(politics)는 llm_text 비중을 높인다.
+
+category_weights:
+  # CONTAMINATION MODE: baseline + tree trained on bootstrap data (features built
+  # at settlement time — circular label leakage). Until clean models are retrained
+  # (≥50 labeled rows in 2026-03-09.parquet), ML models get minimal weight and
+  # llm_intuition_score acts as the primary signal.
+  # When clean models are ready, restore baseline/tree to 0.35-0.45 each.
+  politics:
+    baseline: 0.05
+    tree:     0.05
+    llm_text: 0.90
+  crypto:
+    baseline: 0.05
+    tree:     0.05
+    llm_text: 0.90
+  sports:
+    baseline: 0.10
+    tree:     0.05
+    llm_text: 0.85
+  other:
+    baseline: 0.05
+    tree:     0.05
+    llm_text: 0.90
+
+# 학습 설정
+training:
+  window_days: 90          # 롤링 윈도우 크기 (일)
+  min_samples: 30          # 학습에 필요한 최소 샘플 수
+  retrain_hour_utc: 0      # 매일 재학습 시각 (UTC 시)
+  features_cache_dir: "data/features_cache"
+  models_dir: "models"
+
+# 초기 앙상블이 훈련되기 전 사용하는 naive prior 가중치
+# P_R ≈ w_market * P_M + w_llm * llm_intuition + w_sentiment * (0.5 + sentiment/2)
+naive_prior:
+  w_market:    0.30
+  w_llm:       0.55
+  w_sentiment: 0.15

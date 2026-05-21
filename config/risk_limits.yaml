@@ -1,0 +1,48 @@
+# Risk limit configuration.
+# All values are loaded at runtime; nothing is hardcoded in source files.
+
+# --- Position concentration limits ---
+
+# Maximum fraction of total capital allowed in a single event.
+max_single_event_pct: 0.10
+
+# Maximum fraction per market category.
+max_category_pct:
+  politics: 0.00   # DISABLED 2026-03-20: 1/6 win rate (17%), contaminated ML
+  crypto:   0.30
+  sports:   0.00   # DISABLED 2026-03-20: 0/12 win rate (0%), contaminated ML
+  other:    0.20
+
+# Maximum fraction for a correlated event group
+# (e.g. multiple markets tied to the same election or the same underlying asset).
+# Positions carry a group_id field; all positions sharing the same group_id are summed.
+max_correlated_group_pct: 0.25
+
+# --- Loss limits ---
+
+# Halt new entries and begin gradual deleveraging when daily loss exceeds this fraction.
+max_daily_loss_pct: 0.05
+
+# Same rule applied over a rolling 7-day window.
+max_weekly_loss_pct: 0.10
+
+# --- Kelly sizing ---
+
+# Fractional Kelly multiplier.  0.25 = quarter-Kelly.
+kelly_fraction: 0.25
+
+# Hard cap: no single bet may exceed this fraction of total capital,
+# regardless of Kelly output.
+max_bet_pct: 0.05
+
+# --- Slippage ---
+
+# Maximum tolerated slippage per order (as a fraction of the best quote price).
+max_slippage_pct: 0.01
+
+# --- Virtual (paper-trading) stop-loss ---
+
+# Close a virtual position automatically when its unrealized loss reaches this
+# fraction of its cost basis.  Example: 0.80 = exit when 80 % of the bet is gone.
+# Set to 0.0 to disable (never auto-exit).
+virtual_stop_loss_pct: 0.00

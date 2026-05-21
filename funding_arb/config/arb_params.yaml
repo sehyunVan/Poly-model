@@ -1,0 +1,52 @@
+# Symbols to scan — bot checks all and trades the one with the highest qualifying rate
+# Processed in order; first symbol is the tiebreak
+symbols: [BTCUSDT, ETHUSDT, SOLUSDT]  # BNBUSDT removed 2026-05-06: Spot USDT depleted ($3.54), re-add after topping up Spot balance
+
+# Legacy fields — used by check.py and as fallback if symbols list is missing
+symbol: BTCUSDT
+base_asset: BTC
+
+# Virtual mode — no real orders placed, uses live prices for simulation
+# Set to false only when ready to trade real money on Binance
+virtual_mode: false
+
+# Entry: funding rate per 8h >= this → open position
+# 0.0001 = 0.01%/8h = ~10.95% APY (raised back from 0.00005 — lower threshold caused
+# multi-symbol bot to enter ETH at 5.86% APY while SOL was already open, exhausting
+# spot balance and crashing with 400 errors 10×. With ~$30 spot free after SOL position,
+# only one position fits; 10.95% APY ensures we only enter genuinely high-rate symbols.)
+entry_funding_rate: 0.0001
+
+# Exit: funding rate per 8h < this → close position
+# 0.00002 = 0.002%/8h = ~2.19% APY (not worth the risk)
+exit_funding_rate: 0.00002
+
+# Minimum hold time before any exit is considered (seconds)
+# 1800 = 30min — faster capital turnover, more trading frequency (lowered from 14400=4h)
+min_hold_seconds: 1800
+
+# Position sizing
+position_usdt: 50.0        # raised 30→50 (2026-05-11): ETH position closed, spot balance ~$69 available
+
+# Futures leverage — keep LOW to avoid liquidation
+# At 2x: liquidation ~50% above entry, plenty of buffer
+futures_leverage: 2
+
+# Risk
+# Close if current price is within this fraction of liquidation price
+min_margin_distance: 0.20
+
+# Rebalance if spot/futures qty drifts more than this fraction
+rebalance_threshold: 0.02
+
+# How often to check (seconds)
+poll_interval: 300   # every 5 minutes
+
+# ntfy.sh alert when rate reaches this fraction of entry threshold
+# 0.70 = alert when rate crosses 70% of threshold (approaching entry)
+approach_alert_pct: 0.70
+
+# Negative funding: when rate < -entry_funding_rate, log opportunity + alert
+# Full reverse position (short spot + long perp) requires Binance Margin account
+# Set true only after margin borrowing is configured in spot_client.py
+enable_negative_funding: false

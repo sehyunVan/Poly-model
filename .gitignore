@@ -1,0 +1,63 @@
+# ============================================================
+# SECURITY: Credentials — NEVER commit these
+# ============================================================
+.env
+.env.*
+!.env.example        # allow the template (no real values)
+
+# ============================================================
+# SECURITY: Trained model files (may leak trading patterns)
+# ============================================================
+models/
+*.pkl
+*.joblib
+
+# ============================================================
+# SECURITY: Training data cache (market positions / features)
+# ============================================================
+data/
+*.parquet
+*.csv
+
+# ============================================================
+# SECURITY: Execution logs (order sizes, prices, timing)
+# ============================================================
+logs/
+
+# ============================================================
+# SECURITY: Private operational notes (server IP, wallet, paths)
+# ============================================================
+CLAUDE.md
+.claude/
+
+# ============================================================
+# Python build artefacts
+# ============================================================
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+.eggs/
+.venv/
+venv/
+env/
+.Python
+
+# ============================================================
+# IDE / OS junk
+# ============================================================
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+desktop.ini
+
+*.key
