@@ -282,11 +282,20 @@ def _fetch_redeemable(wallet: str, log: logging.Logger, w3=None) -> list[dict]:
             if len(page) < 100:
                 break
             offset += 100
-        # Correct winner filter:
-        #   A winning CTF token (YES or NO) always prices toward 1.0 at resolution.
-        #   A losing token prices toward 0.0.
-        #   'redeemable' is set on ALL resolved positions (wins AND losses) — filter
-        #   by curPrice to avoid burning POL on worthless losers.
+        # Winner filter: redeemable=true AND curPrice >= 0.97.
+        #
+        # `redeemable` is Polymarket's signal that UMA has finalized the market
+        # on-chain and CTF.redeemPositions() will succeed. It is set true on
+        # BOTH winners and losers post-finalization (losers redeem $0).
+        # `curPrice >= 0.97` further restricts to winners (the loser token
+        # prices toward 0.0).
+        #
+        # Note (2026-06-01 audit): if you see many positions with curPrice ≈ 1.0
+        # but redeemable=false, those are wins still in UMA's finalization window
+        # (typically 24-72h after market end). They will transition to redeemable=
+        # true automatically and be picked up by the next AR cycle. Do NOT drop
+        # the `redeemable` AND check — that causes gas-wasting reverts and double-
+        # counts pending_ctf via the "won but not yet redeemable" path below.
         winners = [
             p for p in all_positions
             if p.get("redeemable") and p.get("curPrice", 0.0) >= 0.97
@@ -468,7 +477,9 @@ def wrap_usdc_e_to_pusd(
             w3.to_checksum_address(_USDC_E), account.address, raw_bal,
         ).build_transaction({
             "from": account.address, "nonce": nonce,
-            "gas": 150_000, "gasPrice": gas_price, "chainId": 137,
+            # wrap() measured at ~156k gas — 150k was too low and reverted out-of-gas
+            # (status=0) on every AR cycle, leaving redeemed USDC.e unwrapped/unusable.
+            "gas": 250_000, "gasPrice": gas_price, "chainId": 137,
         })
         signed  = account.sign_transaction(wrap_tx)
         tx_hash = w3.eth.send_raw_transaction(signed.raw_transaction)

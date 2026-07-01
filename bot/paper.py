@@ -234,6 +234,14 @@ def record_real_execution(pick, ask: float, bet: float, direction: str | None = 
         "yes_votes":    pick.yes_votes,
         "no_votes":     pick.no_votes,
         "whale_strength": pick.whale_strength if hasattr(pick, 'whale_strength') else None,
+        # ── Entry-timing instrumentation (2026-06-11) ──────────────────────────
+        # Lets us test the "early entry" hypothesis directly instead of using ask
+        # as a proxy. hours_to_close = how far before resolution we entered (the
+        # real measure of "early"); volume gives liquidity context. Audit later:
+        # does WR/ROI within the engine band depend on hours_to_close?
+        "hours_to_close": round(pick.market.hours_to_close, 2) if getattr(pick.market, "hours_to_close", None) is not None else None,
+        "volume_24h":     round(pick.market.volume_24h, 2) if getattr(pick.market, "volume_24h", None) is not None else None,
+        "volume_total":   round(pick.market.volume_total, 2) if getattr(pick.market, "volume_total", None) is not None else None,
         "settled":     False,
         "outcome":     None,
         "exit_price":  None,

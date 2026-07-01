@@ -1,0 +1,43 @@
+# perps_params.yaml — Hyperliquid perp paper-trading parameters (Phase 0).
+#
+# Mirrors the spirit of config/crypto_params.yaml but for perp markets.
+# All values here are starting defaults; recalibrate after Phase 0.5 data.
+
+# ── Market ────────────────────────────────────────────────────────────────
+venue:           hyperliquid
+symbol:          BTC                # Phase 0: BTC only. Add ETH/SOL after BTC validates.
+loop_interval:   5                  # seconds between signal evaluations
+
+# ── Trade semantics ───────────────────────────────────────────────────────
+# A "trade" is: open at market on signal fire, hold for `hold_seconds`, close at market.
+# No stops, no signal-flip exits, no take-profit. We need clean EV before adding logic.
+entry_horizon_seconds:  300         # mirror Polymarket 5-min window
+hold_seconds:           300         # close exactly 5 min after entry
+position_notional_usd:  50.0        # paper bet size — sized to mimic poly bot scale
+max_concurrent_positions: 3         # cap simultaneous open trades
+
+# ── Signal gating ─────────────────────────────────────────────────────────
+# score = weighted sum over [-1, +1]; direction = sign(score); trade if |score| >= threshold
+signal_threshold:       0.15        # looser threshold for faster data accumulation in Phase 0
+max_signal_score:       0.95        # skip if crowd is already certain (poly equivalent: 0.65)
+min_book_depth_usd:     5000.0      # require >= $5k notional in top 5 levels each side
+max_spread_bps:         3.0         # skip if spread > 3 bps (illiquid moment)
+
+# Cooldown after a closed trade — prevents back-to-back fires on same signal
+cooldown_seconds:       60
+
+# ── Fee / slippage model (paper) ──────────────────────────────────────────
+# Hyperliquid fees as of 2026-05: ~0.045% taker, ~0.015% maker for retail.
+# Paper trading uses taker model (worst case). Slippage assumes 1 tick worse than mid.
+fee_rate_taker:         0.00045
+slippage_ticks:         1
+tick_size_btc:          1.0         # BTC perp tick = $1.0 (verify on first run)
+
+# ── Funding accrual (paper) ───────────────────────────────────────────────
+# Funding is paid every hour on HL (not 8h like Binance). Paper PnL adjusts for funding
+# proportional to hold duration: pnl_funding = side * notional * funding_rate * (hold_sec / 3600)
+funding_per_hour:       true        # HL is hourly funding cadence
+
+# ── Logging ───────────────────────────────────────────────────────────────
+paper_log_path:         data/perps_paper.jsonl
+state_path:             data/perps_state.json

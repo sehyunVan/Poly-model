@@ -1,0 +1,57 @@
+# LLM-primary up/down paper trading strategy.
+# Asks 2 LLMs for directional call on active Polymarket up/down windows.
+# Bets when LLM conviction diverges from market price by >= min_edge.
+
+virtual_mode: true   # paper only; set LLM_UPDOWN_VIRTUAL_MODE=false for live
+
+scan_interval: 20    # seconds between scan cycles
+
+# Symbols to trade
+symbols: [BTC, ETH, SOL]
+
+# Available timeframes on Polymarket (all BTC/ETH/SOL)
+# window_secs: total window length
+# min_elapsed:  earliest we enter (price has moved enough to have signal)
+# max_elapsed:  latest we enter   (enough time remaining before close)
+# candles:      [interval, count] pairs for price context, short→long
+timeframes:
+  5m:
+    window_secs: 300
+    min_elapsed: 60
+    max_elapsed: 200
+    candles:
+      - [1m, 10]
+      - [5m, 6]
+      - [1h, 4]
+
+  15m:
+    window_secs: 900
+    min_elapsed: 180
+    max_elapsed: 600
+    candles:
+      - [5m, 10]
+      - [15m, 6]
+      - [1h, 6]
+
+  4h:
+    window_secs: 14400
+    min_elapsed: 1800
+    max_elapsed: 9600
+    candles:
+      - [1h, 10]
+      - [4h, 6]
+      - [1d, 6]
+
+# Edge threshold — LLM conviction must diverge from market price by this much.
+min_edge: 0.10
+
+# Max gap between two LLM calls before skipping (too uncertain).
+max_llm_disagreement: 0.25
+
+# Market filters
+min_up_price: 0.10
+max_up_price: 0.90
+
+# Risk: bet size per trade and max concurrent open positions
+bet_abs: 3.0
+max_open_positions: 6   # raised from 3 — 3 symbols × 3 timeframes can all fire

@@ -40,7 +40,7 @@ max_bet_abs: 10.0
 # Wallet budget split — crypto loop only uses this fraction of total CLOB balance.
 # Remaining fraction is reserved for the swarm bot.
 # 0.50 = crypto gets max 50%, swarm gets max 50%.
-wallet_share: 0.50
+wallet_share: 1.00
 
 # Minimum trade size in USDC; smaller bets are skipped.
 # ★ LOWERED 0.5 → 0.20 (2026-05-13): fix the "bet too small" skip that blocks trades.
@@ -62,8 +62,10 @@ inverse_fill_weight_min: 0.5
 # ★ TRADE FREEZE 2026-05-14: max_clob_price set to 0.0 (impossible band) so no
 #   signal ever passes _in_clob_band(). Loop stays alive, AR (auto-redeem) keeps
 #   running every 12h. To re-enable trading, restore max_clob_price to 0.80.
+# ★ RE-ENABLED 2026-06-03: LLM gate data (131 windows) shows +16.6pp WR lift
+#   when LLM agrees. Gate mode now active to filter low-quality signals.
 min_clob_price: 0.75
-max_clob_price: 0.0
+max_clob_price: 0.0   # TRADE FREEZE 2026-06-11: halt crypto (negative EV every window, -$1.24/trade 7d); loop stays alive for AR. Restore 0.85 to re-enable.
 clob_zone2_min: 0.0
 clob_zone2_max: 0.0
 
@@ -211,6 +213,25 @@ pairs_agree_boost: 1.15
 pairs_disagree_block: true
 pairs_window_sec: 60.0
 pairs_min_divergence: 0.002
+
+# ── LLM direction gate ─────────────────────────────────────────────────────────
+# Calls DeepSeek + GPT-4o-mini every llm_gate_interval seconds in a background
+# thread. Caches directional verdict (UP/DOWN) per symbol.
+#
+# llm_gate_enabled=false (default, ghost mode):
+#   LLM direction logged as llm_direction/llm_agrees in signal_log.jsonl but
+#   never blocks trades. Use this to accumulate WR-by-agreement data first.
+#
+# llm_gate_enabled=true (gate mode):
+#   Skips trades where both LLMs oppose the flow signal direction. Only activate
+#   after ghost data confirms LLM-agree WR is ≥5pp higher than LLM-disagree WR
+#   on 100+ signals.
+llm_gate_enabled: true
+llm_gate_interval: 60    # seconds between LLM refreshes per symbol
+# Minimum average confidence (0-100) for the gate to block a trade.
+# Both LLMs must agree AND their avg confidence must be >= this value.
+# 55 = slightly above coin-flip; raises to ~60 when both are very certain.
+llm_gate_min_conf: 55
 
 # Contrarian mode: buy the opposite token from the signal.
 # Used by the 15m loop — see crypto_15m_params.yaml.

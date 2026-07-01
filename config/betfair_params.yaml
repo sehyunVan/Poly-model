@@ -1,0 +1,51 @@
+# Betfair FOOTBALL (soccer) MATCH_ODDS paper trading bot.
+#
+# Pivoted from horse racing 2026-06-30. Purpose: test whether the price-orthogonal
+# swarm-LLM edge proven on Polymarket (component B — "LLM reads news better than the
+# crowd") transfers to news-driven football match outcomes.
+# Sequencing: FIFA World Cup pilot (now–~Jul 19, deep liquidity + max news coverage)
+#             → European club season from August (EPL/UCL/etc. — large ongoing universe).
+virtual_mode: true        # paper only — no real bets
+
+# credentials via env: BETFAIR_USERNAME / BETFAIR_PASSWORD / BETFAIR_APP_KEY
+username: ""
+password: ""
+app_key: ""
+
+# ── Market selection ────────────────────────────────────────────────────────
+event_type_ids: ["1"]              # 1 = Soccer
+market_type_codes: ["MATCH_ODDS"]  # 3-way: Home / Draw / Away
+market_countries: []               # all — the liquidity filter does the real selection
+
+# Liquidity whitelist: only evaluate deep, news-covered markets. This single rule
+# auto-selects the World Cup now, EPL/UCL/top leagues from August, and permanently
+# excludes RAG-blind minor leagues (Mongolian/Vietnamese U21/etc.) where the LLM has
+# no news to read and the edge premise cannot hold.
+min_liquidity_gbp: 50000
+
+# ── Entry window (before kickoff) ───────────────────────────────────────────
+# Confirmed lineups drop ~60 min pre-KO; enter while the market is still adjusting.
+min_minutes_before_ko: 20
+max_minutes_before_ko: 90
+
+# ── Signal gates ────────────────────────────────────────────────────────────
+min_ai_agree_frac: 0.55    # fraction of non-erroring models voting the plurality outcome
+min_confidence:    60      # avg confidence across the agreeing models
+min_swarm_score:   0.55    # agree_frac * (avg_conf/100)
+
+# ── Odds gate (backed outcome, decimal) ─────────────────────────────────────
+# Avoid ultra-short favourites (tiny payout vs 5% commission) and longshots.
+min_odds_back: 1.5
+max_odds_back: 8.0
+
+# ── Sizing ──────────────────────────────────────────────────────────────────
+bet_size_gbp:    5.0
+commission_rate: 0.05      # Betfair standard 5% on net winnings
+
+# ── Loop timing ─────────────────────────────────────────────────────────────
+poll_interval:    20
+market_cache_ttl: 60
+
+# ── Data files ──────────────────────────────────────────────────────────────
+paper_log:  data/betfair_paper.jsonl
+state_file: data/betfair_state.json

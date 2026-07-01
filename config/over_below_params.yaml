@@ -1,0 +1,60 @@
+# Over/Below LLM scanner parameters.
+# All values are loaded at startup; changes take effect on next restart.
+
+# Paper mode (default). Set OVER_BELOW_VIRTUAL_MODE=false in .env for live orders.
+virtual_mode: true
+
+# Seconds between scan cycles (10 minutes).
+scan_interval: 600
+
+# ── Market eligibility ─────────────────────────────────────────────────────────
+
+# Time-to-close window: skip markets that expire sooner than min_hours or
+# later than max_hours. Very short horizons have no edge (price is nearly set);
+# very long horizons (>30d) have high uncertainty that overwhelms LLM context.
+min_hours:     2.0
+max_hours:     720.0   # 30 days
+
+# Minimum 24h volume in USDC — thin markets have bad fills and stale prices.
+# OB price markets tend to have lower volume than event markets; 100 is sufficient
+# to ensure there's real liquidity for a $5 bet.
+min_volume_24h: 100.0
+
+# Market yes_price eligibility band.
+# Skip markets that are already near-certain to avoid buying at 0.95+ where
+# payout is insufficient to cover fees and model error.
+min_yes_price: 0.10
+max_yes_price: 0.90
+
+# Maximum required % move (abs) from current price to threshold.
+# BTC at $67k asking "above $200k by June?" is not useful — too far to call.
+max_move_pct: 60.0
+
+# Symbols to evaluate.
+symbols: [BTC, ETH, SOL]
+
+# ── Edge detection ─────────────────────────────────────────────────────────────
+
+# Minimum gap between avg LLM probability and market yes_price to generate a signal.
+# 0.12 = 12 percentage points. At min_yes_price=0.10 that means LLM must say ≥22%
+# for us to bet YES on a 10% market (or ≤-2% to bet NO, which won't happen).
+min_edge: 0.12
+
+# Maximum disagreement between the two LLMs.
+# If model 1 says 70% and model 2 says 40%, the edge is noisy — skip.
+max_llm_disagreement: 0.20
+
+# ── Risk controls ──────────────────────────────────────────────────────────────
+
+# Paper/live bet size per trade in USDC.
+bet_abs: 5.0
+
+# Maximum open (unsettled) positions at any time.
+# Scanner keeps deploying whenever slots are available — no daily reset.
+# Positions free up as they settle, allowing new bets throughout the month.
+max_open_positions: 5
+
+# Maximum markets evaluated per scan cycle with LLM calls.
+# Controls API spend: at ~$0.002/market × 10 = $0.02/cycle × 144 cycles/day = $2.88/day max.
+# At typical 1-2 candidates/scan, real spend is much lower.
+max_per_scan: 10

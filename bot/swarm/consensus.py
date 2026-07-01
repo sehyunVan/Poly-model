@@ -37,9 +37,26 @@ from typing import Optional
 from bot.config import ACTIVE_MODELS, CONSENSUS_TOP_N
 from bot.data.markets import MarketData
 from bot.data.whale import WhaleSignal, WhaleFeed, get_whale_signals, whale_feed
-from bot.swarm.models import Decision, ModelVerdict, ask_swarm, synthesize_verdicts
+from bot.swarm.models import Decision, ModelVerdict, ask_swarm, classify_market, synthesize_verdicts
 
 log = logging.getLogger(__name__)
+
+# ── Whale gate toggle ─────────────────────────────────────────────────────────
+# ★ 2026-06-14: whale trigger made OPTIONAL (user decision — too few positions were
+# being opened because whale triggers are rare, leaving most capital idle).
+#   REQUIRE_WHALE = True  → proven strategy: only AI-evaluate whale-triggered markets,
+#                          bet the WHALE's direction once the model majority confirms it
+#                          (85% WR / +$432 over 14d).
+#   REQUIRE_WHALE = False → AI-evaluate EVERY filtered candidate. With no whale to
+#                          follow, the bet DIRECTION comes from the model majority and
+#                          the score is the pure AI score (no whale component). Whale,
+#                          when present, is still used for the alignment/sizing logic.
+# The YES-direction block + [0.65,0.78) band in execution.py still constrain every
+# trade, so whale-off only ever opens NO bets the panel is confident about.
+# ★ 2026-06-14 (later same day): REVERTED to True — user reverted the whale-off
+# experiment back to the proven whale-triggered strategy (band stays relaxed at
+# [0.65,0.78)). The whale-off path/code is retained intact for one-line re-enable.
+REQUIRE_WHALE = True
 
 # ── Gate thresholds ───────────────────────────────────────────────────────────
 WHALE_STRENGTH_MIN = 0.30   # minimum whale flow imbalance to consider
@@ -47,6 +64,16 @@ AI_AGREE_MIN       = 0.50   # majority of all models must vote consensus directi
 EXEC_SCORE_MIN     = 0.60   # ★ relaxed 0.70→0.60 (2026-05-14): paper-only NO in [0.60–0.70) now 88.6% WR / +$83 on 79 trades; 2026-04-18 tightening superseded by post-synthesis data
 AVG_CONF_MIN       = 70.0   # strongest predictor (corr=+0.38): 82.9% WR at ≥70 vs 77.8% at ≥65
 DEEPSEEK_NAME      = "deepseek"  # model name for quality-oracle logging
+
+# ── Excluded categories (LLM-classified, not keyword) ─────────────────────────
+# ★ 2026-06-21: drop structurally -EV categories before spending RAG + a vote.
+# Multi-week settled data: tennis -$96 all-time / -$161 last 28d (high-upset
+# individual sport, NO-favorite miscalibration at thin payout); politics -$31
+# all-time / -$51 last 28d (news/geopolitics — a single LLM has no edge). Every
+# other category (soccer/mlb/esports/other) is +EV and improving. Classification
+# is done by classify_market() (one cheap cached LLM call), so it generalises to
+# new phrasings a keyword list would miss. Empty this set to disable.
+EXCLUDED_CATEGORIES = {"tennis", "politics"}
 
 
 # ── Result type ───────────────────────────────────────────────────────────────
@@ -142,24 +169,41 @@ def _composite_score(whale_strength: float, ai_score: float) -> float:
 
 async def evaluate_market(
     market: MarketData,
-    whale: WhaleSignal,
+    whale: Optional[WhaleSignal],
 ) -> Optional[MarketConsensus]:
     """
-    Run AI swarm to validate whale signal.
-    Returns None if whale is too weak or AI doesn't agree.
+    Run the AI swarm on a market.
+
+    Whale-required mode (REQUIRE_WHALE=True): `whale` must have a signal; the bet
+    follows the whale direction once the model majority confirms it.
+
+    Whale-off mode (REQUIRE_WHALE=False): `whale` may be None / no-signal; the bet
+    direction is the model majority and the score is the pure AI score.
     """
-    if not whale.has_signal:
-        log.debug("Skip %r — no whale signal (strength=%.2f)", market.question[:40], whale.strength)
+    has_whale = whale is not None and whale.has_signal
+
+    if REQUIRE_WHALE and not has_whale:
+        log.debug("Skip %r — no whale signal", market.question[:40])
         return None
 
+    # ── Category gate ───────────────────────────────────────────────────────────
+    # Drop structurally -EV categories (tennis, politics) via one cheap cached LLM
+    # call, BEFORE the expensive RAG + swarm vote. Smarter than keywords.
+    if EXCLUDED_CATEGORIES:
+        category = await classify_market(market)
+        if category in EXCLUDED_CATEGORIES:
+            log.info("SKIP category=%s (excluded, -EV) — %s", category, market.question[:55])
+            return None
+
     verdicts, context = await ask_swarm(market, whale)
+    whale_dir = whale.direction if has_whale else ""
     ai_score, yes_v, no_v, skip_v, avg_conf, agree_frac, model_direction = _score_verdicts(
-        verdicts, whale.direction
+        verdicts, whale_dir
     )
 
-    # ── Blind alignment check ──────────────────────────────────────────────────
-    # Models voted without seeing the whale direction. Only proceed if their
-    # independent majority matches the whale — both sources agree on direction.
+    # ── Direction ───────────────────────────────────────────────────────────────
+    # Need a clear model majority either way (whale-off: it IS the decision;
+    # whale-on: it's the independent confirmation of the whale).
     if model_direction == "NONE":
         log.info(
             "No-majority SKIP %r — models split (yes=%d no=%d skip=%d), no clear direction",
@@ -167,19 +211,23 @@ async def evaluate_market(
         )
         return None
 
-    # ★ MODIFIED 2026-04-27: Direction-mismatch from SKIP → SIZE 50%
-    # Was: hard-block when model_direction ≠ whale_direction
-    # Now: allow trade but mark for reduced sizing (0.5× multiplier)
-    # Reason: whale might be wrong, models might be right — test if they're profitable
-    # After 50+ mismatch trades: decide if filter should stay removed or reinstated
     direction_mismatch_penalty = 1.0
-    if model_direction != whale.direction:
-        log.info(
-            "Direction-mismatch eval: models say %s, whale says %s "
-            "→ sizing at 50%% (was skip) — %s",
-            model_direction, whale.direction, market.question[:50]
-        )
-        direction_mismatch_penalty = 0.5  # Apply 50% sizing penalty, continue
+    if has_whale:
+        # Proven blind-alignment path: bet the whale's direction. Models voted without
+        # seeing it; a mismatch is allowed but sized at 0.5× (★ 2026-04-27).
+        bet_direction = whale.direction
+        whale_score   = whale.strength
+        if model_direction != whale.direction:
+            log.info(
+                "Direction-mismatch eval: models say %s, whale says %s "
+                "→ sizing at 50%% — %s",
+                model_direction, whale.direction, market.question[:50],
+            )
+            direction_mismatch_penalty = 0.5
+    else:
+        # Whale-off: the model majority IS the decision, no whale to align to.
+        bet_direction = model_direction
+        whale_score   = 0.0
 
     # ── Remaining quality gates ────────────────────────────────────────────────
     if agree_frac < AI_AGREE_MIN:
@@ -199,8 +247,9 @@ async def evaluate_market(
         )
         return None
 
-    whale_score = whale.strength
-    score       = _composite_score(whale_score, ai_score)
+    # Score: whale-on keeps the composite (whale×0.5 + ai×0.5); whale-off uses the
+    # pure AI score so the 0.60 floor still means "panel is genuinely confident".
+    score = _composite_score(whale_score, ai_score) if has_whale else round(ai_score, 4)
 
     # ★ Score ceiling REMOVED 2026-05-14: paper-only NO with score>=0.80 = 13 trades,
     # 100% WR, +$33.81 real PnL. Historic "0% WR n=6" claim that motivated the ceiling
@@ -212,7 +261,7 @@ async def evaluate_market(
         )
         return None
 
-    direction = Decision.YES if whale.direction == "YES" else Decision.NO
+    direction = Decision.YES if bet_direction == "YES" else Decision.NO
 
     # ── Round-1 deepseek veto ──────────────────────────────────────────────────
     # Deepseek abstains on 87% of losses vs 63% of wins — cheap pre-filter
@@ -281,7 +330,7 @@ async def evaluate_market(
     log.info(
         "%r  whale=%s(%.2f)  models=%s  ai_agree=%.0f%%  conf=%.0f%%  score=%.3f  "
         "synthesis=%s(%.0f)",
-        market.question[:40], whale.direction, whale_score,
+        market.question[:40], (whale.direction if has_whale else "none"), whale_score,
         model_direction, agree_frac * 100, avg_conf, score,
         synthesis.decision.value if synthesis else "n/a",
         synthesis_confidence or 0.0,
@@ -298,7 +347,7 @@ async def evaluate_market(
         no_trade_votes=skip_v,
         avg_confidence=avg_conf,
         ai_agree_frac=agree_frac,
-        whale=whale,
+        whale=whale if has_whale else None,
         verdicts=verdicts,
         synthesis_confidence=synthesis_confidence,
         synthesis_reasoning=synthesis_reasoning,
@@ -338,27 +387,38 @@ async def run_swarm(
 
     # Fetch whale signals (WS buffer first, REST fallback)
     whale_map = await get_whale_signals(markets, feed)
+    n_whale   = sum(1 for m in markets if whale_map.get(m.id) and whale_map[m.id].has_signal)
 
-    # Filter to only markets with a whale signal
-    whale_markets = [
-        (m, whale_map[m.id])
-        for m in markets
-        if whale_map.get(m.id) and whale_map[m.id].has_signal
-    ]
+    if REQUIRE_WHALE:
+        # Proven path: only AI-evaluate whale-triggered markets.
+        eval_list = [
+            (m, whale_map[m.id])
+            for m in markets
+            if whale_map.get(m.id) and whale_map[m.id].has_signal
+        ]
+        log.info(
+            "Swarm: %d candidates  %d have whale signals  (%d models each)",
+            len(markets), n_whale, len(ACTIVE_MODELS),
+        )
+        if not eval_list:
+            log.info("No whale signals this cycle — no AI calls made.")
+            return []
+    else:
+        # Whale gate OFF: AI-evaluate EVERY candidate. Whale (if any) still informs
+        # direction/sizing inside evaluate_market; otherwise the model majority decides.
+        eval_list = [(m, whale_map.get(m.id)) for m in markets]
+        log.info(
+            "Swarm: %d candidates  %d have whale signals  WHALE GATE OFF — evaluating ALL  (%d models each)",
+            len(markets), n_whale, len(ACTIVE_MODELS),
+        )
 
-    log.info(
-        "Swarm: %d candidates  %d have whale signals  (%d models each)",
-        len(markets), len(whale_markets), len(ACTIVE_MODELS),
-    )
-
-    if not whale_markets:
-        log.info("No whale signals this cycle — no AI calls made.")
-        return []
-
-    # Run AI on whale-triggered markets sequentially (rate limit protection)
+    # Run AI on each market sequentially (rate limit protection)
     results = []
-    for market, whale in whale_markets:
-        log.info("Evaluating whale: %s  %s", whale.summary(), market.question[:50])
+    for market, whale in eval_list:
+        if whale and whale.has_signal:
+            log.info("Evaluating whale: %s  %s", whale.summary(), market.question[:50])
+        else:
+            log.info("Evaluating (no whale): %s", market.question[:50])
         result = await evaluate_market(market, whale)
         if result is not None:
             results.append(result)

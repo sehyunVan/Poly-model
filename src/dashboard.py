@@ -55,17 +55,6 @@ _STRIKE_CFG_PATH    = "config/strike_params.yaml"
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
-def _load_raw_state() -> dict:
-    """Load raw portfolio state from disk."""
-    path = _ROOT / (_VIRTUAL_STATE_PATH if _VIRTUAL_MODE else _REAL_STATE_PATH)
-    if path.exists():
-        try:
-            return json.loads(path.read_text(encoding="utf-8"))
-        except Exception as exc:
-            return {"error": str(exc)}
-    return {"error": f"State file not found: {path}"}
-
-
 def _load_swarm_state() -> dict:
     """Load swarm bot state from disk, enriched with pending CTF value AND on-chain
     positions cross-referenced with the swarm_real_trades.jsonl metadata."""
@@ -99,6 +88,24 @@ def _load_swarm_state() -> dict:
             pass
     data["pending_ctf_usdc"] = round(pending_ctf, 2)
     data["real_net_pnl"] = round((data.get("real_pnl") or 0.0) + pending_ctf, 2)
+
+    # ── Total portfolio (on-chain) — what's recoverable right now ───────────────
+    # total_recoverable = liquid cash + won-redeemable + won-pending-UMA + in-play
+    # current value. Surfaced as a top-of-page summary card group.
+    if "error" not in wallet:
+        data["wallet"] = {
+            "total_recoverable": wallet.get("total_recoverable", 0.0),
+            "cash_usdc":         wallet.get("cash_usdc", 0.0),
+            "pol_balance":       wallet.get("pol_balance", 0.0),
+            "won_redeemable":    wallet.get("won_redeemable", 0.0),
+            "won_pending":       wallet.get("won_pending", 0.0),
+            "in_play_curval":    wallet.get("in_play_curval", 0.0),
+            "in_play_face":      wallet.get("in_play_face", 0.0),
+            "lost_face":         wallet.get("lost_face", 0.0),
+            "counts":            wallet.get("counts", {}),
+        }
+    else:
+        data["wallet"] = {"error": wallet.get("error", "wallet unavailable")}
 
     # Era split — always computed from JSONL regardless of wallet availability.
     # Splits cumulative real PnL into (a) live strategy = NO direction (current policy)
@@ -136,6 +143,37 @@ def _load_swarm_state() -> dict:
     data["live_strategy"] = live
     data["legacy_yes"]    = legacy
     data["recent_14d_no"] = recent
+
+    # ── Real-time PnL chart — cumulative over settled NO trades (live strategy) ──
+    # One point per settled NO-direction trade, time-ordered by exit_ts (fall back
+    # to entry_ts). This is the live-policy equity curve the dashboard plots.
+    no_settled = [
+        r for r in jsonl_all
+        if (r.get("direction") or "").upper() == "NO" and r.get("settled")
+    ]
+
+    def _row_ts(r: dict) -> str:
+        return r.get("exit_ts") or r.get("entry_ts") or ""
+
+    no_settled.sort(key=_row_ts)
+    rt_chart: list[dict] = []
+    running = 0.0
+    for r in no_settled:
+        pnl = float(r.get("pnl") or 0)
+        running += pnl
+        ts = _row_ts(r)
+        try:
+            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+            label = dt.strftime("%m/%d %H:%M")
+        except Exception:
+            label = ts[:16]
+        rt_chart.append({
+            "label":      label,
+            "title":      (r.get("question") or "")[:40],
+            "trade_pnl":  round(pnl, 2),
+            "cumulative": round(running, 2),
+        })
+    data["pnl_chart"] = rt_chart
 
     if "error" not in wallet:
         # Build a {question_lower: jsonl_record} index from JSONL for metadata lookup
@@ -700,11 +738,19 @@ def _load_wallet_state() -> dict:
     try:
         w3 = Web3(Web3.HTTPProvider("https://rpc-mainnet.matic.quiknode.pro"))
         addr = w3.eth.account.from_key(key).address
+        _bal_abi = [{"inputs":[{"name":"a","type":"address"}],"name":"balanceOf",
+                     "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}]
+        # Liquid collateral = USDC.e (V1) + pUSD (V2). Post the 2026-04-28 V2 upgrade
+        # the CLOB only spends pUSD; redeemed CTF wins arrive as USDC.e and are wrapped
+        # to pUSD by the AR cycle. Counting only USDC.e (the old code) reported $0 cash
+        # whenever funds had been wrapped, even with hundreds of dollars of pUSD on hand.
         usdc_e = w3.eth.contract(
-            w3.to_checksum_address("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"),
-            abi=[{"inputs":[{"name":"a","type":"address"}],"name":"balanceOf",
-                  "outputs":[{"name":"","type":"uint256"}],"stateMutability":"view","type":"function"}],
+            w3.to_checksum_address("0x2791bca1f2de4661ed88a30c99a7a9449aa84174"), abi=_bal_abi,
         ).functions.balanceOf(addr).call() / 1e6
+        pusd = w3.eth.contract(
+            w3.to_checksum_address("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB"), abi=_bal_abi,
+        ).functions.balanceOf(addr).call() / 1e6
+        usdc_e = usdc_e + pusd
         pol = float(w3.from_wei(w3.eth.get_balance(addr), "ether"))
     except Exception as exc:
         return {"error": f"web3 call failed: {exc}"}
@@ -799,21 +845,22 @@ def _build_api_response(raw: dict) -> dict:
     available         = float(raw.get("available_usdc", 0))
     initial_budget    = float(raw.get("initial_budget", 1000))
     deployed          = sum(float(p.get("size_usdc", 0)) for p in positions)
-    # real_clob_balance: actual on-chain USDC.e, synced at startup (C1) and every 10 min (AR).
-    # Use this as the ground-truth wallet figure — available_usdc drifts between syncs.
-    real_clob_balance = float(raw.get("real_clob_balance", available))
-    # pending_ctf_usdc: value of won positions whose CTF tokens have not been redeemed yet.
-    # Live source: on-chain wallet (won_redeemable + won_pending), 60s cache. Fallback to
-    # raw state's pending_ctf_usdc only if web3 is unreachable — that field only refreshes
-    # on the 12h AR cycle and goes stale otherwise (over-counts redemptions already done).
+    # real_clob_balance: liquid CLOB-spendable collateral.
+    # PRIMARY source is the live on-chain wallet cash (USDC.e + pUSD, 60s cache) — it is
+    # always current. The raw-state real_clob_balance field is only written by the crypto
+    # loop's balance-sync (C1 startup + 12h AR). If that loop is stopped or stuck, the field
+    # goes stale and the card shows a frozen number that no longer matches the real budget.
+    # Fall back to the raw-state value only if web3 is unreachable.
     _wallet = _load_wallet_state()
     if "error" not in _wallet:
+        real_clob_balance = float(_wallet.get("cash_usdc", raw.get("real_clob_balance", available)))
         unredeemed_ctf = round(
             float(_wallet.get("won_redeemable", 0.0))
             + float(_wallet.get("won_pending", 0.0)),
             2,
         )
     else:
+        real_clob_balance = float(raw.get("real_clob_balance", available))
         unredeemed_ctf = round(float(raw.get("pending_ctf_usdc", 0.0)), 2)
     # total: everything we own — liquid CLOB + won-but-not-yet-redeemed CTF tokens + open bets.
     total             = round(real_clob_balance + unredeemed_ctf + deployed, 2)
@@ -1226,185 +1273,51 @@ _HTML = """\
 <div id="global-js-error" style="display:none;background:#f85149;color:#fff;padding:10px 16px;font-family:monospace;font-size:13px;position:fixed;top:0;left:0;right:0;z-index:9999;word-break:break-all"></div>
 
 <div class="header">
-  <h1>Polymarket Dashboard</h1>
+  <h1>AI Swarm — Polymarket</h1>
   <span id="mode-badge" class="badge badge-virtual">VIRTUAL</span>
   <span class="refresh-info" id="refresh-info">Refreshing in <span id="countdown">30</span>s</span>
   <span class="refresh-info" id="updated-at"></span>
 </div>
 
 <div class="main">
-  <div class="tabs">
-    <button class="tab-btn active" onclick="switchTab('crypto')">Crypto Loop</button>
-    <button class="tab-btn" onclick="switchTab('swarm')">AI Swarm</button>
-    <button class="tab-btn" onclick="switchTab('arb')">Funding Arb</button>
-    <button class="tab-btn" onclick="switchTab('conviction')">Arbitrage (Conviction)</button>
-  </div>
+  <div id="swarm-error" class="error-box hidden"></div>
 
-  <div id="error-box" class="error-box hidden"></div>
-
-  <div id="tab-crypto" class="tab-pane active">
-
-  <!-- ── True wallet view (on-chain) ──────────────────────────────────── -->
-  <div class="card-group">
-    <p class="card-group-label">True Wallet (on-chain) — what's actually recoverable right now</p>
-    <div class="cards">
-      <div class="card">
-        <div class="card-label">Total Recoverable</div>
-        <div class="card-value pos" id="w-total">—</div>
-        <div class="card-sub" id="w-total-sub">cash + pending + in-play current</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Liquid Cash</div>
-        <div class="card-value" id="w-cash">—</div>
-        <div class="card-sub" id="w-pol">— POL gas</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Won, Pending UMA</div>
-        <div class="card-value pos" id="w-pending">—</div>
-        <div class="card-sub" id="w-pending-cnt">— markets · resolved, awaiting finalize</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Won, Redeemable</div>
-        <div class="card-value pos" id="w-redeem">—</div>
-        <div class="card-sub" id="w-redeem-cnt">— markets · AR sweeps next cycle</div>
-      </div>
-      <div class="card">
-        <div class="card-label">In-Play (current)</div>
-        <div class="card-value neu" id="w-inplay-cur">—</div>
-        <div class="card-sub" id="w-inplay-face">face $— · — markets</div>
-      </div>
-      <div class="card card-dim">
-        <div class="card-label">Lost (cumulative)</div>
-        <div class="card-value dim" id="w-lost">—</div>
-        <div class="card-sub" id="w-lost-cnt">— markets · written off</div>
+    <!-- ── Total portfolio (on-chain) — recoverable right now ──────────────── -->
+    <div class="card-group">
+      <p class="card-group-label">Total Portfolio (on-chain) — what's actually recoverable right now</p>
+      <div class="cards">
+        <div class="card">
+          <div class="card-label">Total Portfolio</div>
+          <div class="card-value pos" id="w-total">—</div>
+          <div class="card-sub" id="w-total-sub">liquid + redeemable + pending + in-play</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Liquid Cash</div>
+          <div class="card-value" id="w-cash">—</div>
+          <div class="card-sub" id="w-pol">— POL gas</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Won, Redeemable</div>
+          <div class="card-value pos" id="w-redeem">—</div>
+          <div class="card-sub" id="w-redeem-cnt">— markets · AR sweeps next cycle</div>
+        </div>
+        <div class="card">
+          <div class="card-label">Won, Pending UMA</div>
+          <div class="card-value pos" id="w-pending">—</div>
+          <div class="card-sub" id="w-pending-cnt">— markets · resolved, awaiting finalize</div>
+        </div>
+        <div class="card">
+          <div class="card-label">In-Play (deployed)</div>
+          <div class="card-value neu" id="w-inplay-cur">—</div>
+          <div class="card-sub" id="w-inplay-face">face $— · — markets</div>
+        </div>
+        <div class="card card-dim">
+          <div class="card-label">Lost (cumulative)</div>
+          <div class="card-value dim" id="w-lost">—</div>
+          <div class="card-sub" id="w-lost-cnt">— markets · written off</div>
+        </div>
       </div>
     </div>
-  </div>
-
-  <!-- Logical portfolio group -->
-  <div class="card-group">
-    <p class="card-group-label">Logical Portfolio — what we own</p>
-    <div class="cards">
-      <div class="card">
-        <div class="card-label">Total Portfolio</div>
-        <div class="card-value" id="c-budget">—</div>
-        <div class="card-sub" id="c-budget-breakdown">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">True PnL (cash)</div>
-        <div class="card-value" id="c-realpnl">—</div>
-        <div class="card-sub" id="c-realpnl-sub">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Portfolio ROI</div>
-        <div class="card-value" id="c-cpnl">—</div>
-        <div class="card-sub" id="c-roi">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Today PnL</div>
-        <div class="card-value" id="c-dpnl">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Hit Rate</div>
-        <div class="card-value" id="c-hit">—</div>
-        <div class="card-sub" id="c-closed">—</div>
-      </div>
-      <div class="card">
-        <div class="card-label">Open Positions</div>
-        <div class="card-value neu" id="c-pos">—</div>
-        <div class="card-sub" id="c-pos-usdc">—</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Real wallet group -->
-  <div class="card-group">
-    <p class="card-group-label">Real Wallet — liquid USDC (operational context)</p>
-    <div class="cards">
-      <div class="card card-dim">
-        <div class="card-label">Wallet Balance <span class="card-tag tag-liquid">LIQUID</span></div>
-        <div class="card-value" id="c-avail">—</div>
-        <div class="card-sub" id="c-avail-pct">—</div>
-      </div>
-      <div class="card card-dim">
-        <div class="card-label">In Open Bets <span class="card-tag tag-locked">LOCKED</span></div>
-        <div class="card-value dim" id="c-deployed">—</div>
-        <div class="card-sub" id="c-deploy-pct">—</div>
-      </div>
-      <div class="card card-dim">
-        <div class="card-label">Est. Total Deposited</div>
-        <div class="card-value dim" id="c-total">—</div>
-        <div class="card-sub">current balance − net PnL</div>
-      </div>
-    </div>
-  </div>
-
-  <!-- Budget doughnut + Category bar -->
-  <div class="charts">
-    <div class="chart-box">
-      <div class="chart-title">Portfolio Breakdown</div>
-      <canvas id="budget-chart" width="260" height="260"></canvas>
-    </div>
-    <div class="chart-box">
-      <div class="chart-title">Deployed by Category (USDC)</div>
-      <canvas id="cat-chart" height="180"></canvas>
-    </div>
-  </div>
-
-  <!-- PnL History -->
-  <div class="pnl-chart-wrap" id="pnl-section">
-    <div class="chart-title" style="display:flex;justify-content:space-between;align-items:center;">
-      <span>Real-time PnL — per trade</span>
-      <span id="pnl-trade-count" style="font-size:11px;color:var(--muted)"></span>
-    </div>
-    <canvas id="pnl-chart" height="120"></canvas>
-  </div>
-
-  <!-- Open Positions -->
-  <p class="section-title" id="pos-title">Open Positions</p>
-  <div class="table-wrap">
-    <table>
-      <thead>
-        <tr>
-          <th>#</th>
-          <th>Market</th>
-          <th>Cat</th>
-          <th>Dir</th>
-          <th>Size (USDC)</th>
-          <th>Fill Price</th>
-          <th>Age (d)</th>
-        </tr>
-      </thead>
-      <tbody id="pos-body"></tbody>
-    </table>
-  </div>
-
-  <!-- Closed Positions -->
-  <div id="closed-section" class="hidden">
-    <p class="section-title">Settled Positions (last 20)</p>
-    <div class="table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>#</th>
-            <th>Market</th>
-            <th>Dir</th>
-            <th>Bet</th>
-            <th>Fill</th>
-            <th>Outcome</th>
-            <th>PnL</th>
-            <th>Closed At</th>
-          </tr>
-        </thead>
-        <tbody id="closed-body"></tbody>
-      </table>
-    </div>
-  </div>
-  </div><!-- /tab-crypto -->
-
-  <!-- ── Swarm tab ─────────────────────────────────────────────────────────── -->
-  <div id="tab-swarm" class="tab-pane">
-    <div id="swarm-error" class="error-box hidden"></div>
 
     <!-- Era split (decision-relevant: NO-only is the live policy) -->
     <div class="card-group">
@@ -1478,6 +1391,15 @@ _HTML = """\
       </div>
     </div>
 
+    <!-- Real-time PnL chart (NO-only live strategy equity curve) -->
+    <div class="pnl-chart-wrap" id="swarm-pnl-section">
+      <div class="chart-title" style="display:flex;justify-content:space-between;align-items:center;">
+        <span>Real-time PnL — AI Swarm (NO, cumulative per settled trade)</span>
+        <span id="swarm-pnl-trade-count" style="font-size:11px;color:var(--muted)"></span>
+      </div>
+      <canvas id="swarm-pnl-chart" height="120"></canvas>
+    </div>
+
     <!-- Open positions (ON-CHAIN truth, cross-referenced with JSONL metadata) -->
     <div id="swarm-real-open-section">
       <p class="section-title" id="swarm-real-open-title">Open Positions (0)</p>
@@ -1538,273 +1460,6 @@ _HTML = """\
       </div>
     </div>
 
-    <!-- Paper analysis (secondary) -->
-    <div class="card-group" style="margin-top:32px">
-      <p class="card-group-label">Paper Analysis (@ $10/trade — all AI-gate picks)</p>
-      <div class="cards">
-        <div class="card">
-          <div class="card-label">Win Rate</div>
-          <div class="card-value" id="s-wr">—</div>
-          <div class="card-sub" id="s-settled">— settled</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Total PnL</div>
-          <div class="card-value" id="s-pnl">—</div>
-          <div class="card-sub" id="s-dpnl">today: —</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Open Picks</div>
-          <div class="card-value neu" id="s-open">—</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Current cycle picks -->
-    <p class="section-title" style="margin-top:24px">Last Cycle Picks</p>
-    <div id="swarm-picks"></div>
-
-    <!-- Settled paper trades -->
-    <div id="s-closed-section" class="hidden">
-      <p class="section-title">Recent Paper Picks</p>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>#</th><th>Market</th><th>Dir</th><th>Score</th>
-              <th>Entry</th><th>Outcome</th><th>PnL ($10)</th>
-            </tr>
-          </thead>
-          <tbody id="s-closed-body"></tbody>
-        </table>
-      </div>
-    </div>
-  </div><!-- /tab-swarm -->
-
-  <!-- ── Funding Arb tab ───────────────────────────────────────────────────── -->
-  <div id="tab-arb" class="tab-pane">
-    <div id="arb-error" class="error-box hidden"></div>
-
-    <div class="card-group">
-      <p class="card-group-label">Binance Funding Rate Arb — Multi-Symbol Delta-Neutral (Long Spot + Short Perp)</p>
-      <div class="cards">
-        <div class="card">
-          <div class="card-label">Status</div>
-          <div class="card-value neu" id="arb-status">—</div>
-          <div class="card-sub" id="arb-mode-sub">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Funding Collected</div>
-          <div class="card-value" id="arb-funding">—</div>
-          <div class="card-sub" id="arb-trades">— cycles</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Realized PnL</div>
-          <div class="card-value" id="arb-pnl">—</div>
-          <div class="card-sub">spot + funding</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Active Symbol</div>
-          <div class="card-value neu" id="arb-active-symbol">—</div>
-          <div class="card-sub" id="arb-qty">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Entry → Current</div>
-          <div class="card-value dim" id="arb-entry">—</div>
-          <div class="card-sub" id="arb-age">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Pending Funding</div>
-          <div class="card-value dim" id="arb-pending">—</div>
-          <div class="card-sub" id="arb-errors-sub">0 errors</div>
-        </div>
-      </div>
-    </div>
-
-    <!-- Live rate scan -->
-    <p class="section-title">Live Funding Rates (last scan)</p>
-    <div class="table-wrap" style="margin-bottom:20px">
-      <table>
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>Rate / 8h</th>
-            <th>APY</th>
-            <th>Direction</th>
-            <th>vs Threshold (10.95%)</th>
-          </tr>
-        </thead>
-        <tbody id="arb-rates-body"></tbody>
-      </table>
-    </div>
-
-    <p class="section-title">Recent Log</p>
-    <div style="background:var(--surface);border:1px solid var(--border);border-radius:6px;padding:12px;font-family:monospace;font-size:12px;max-height:260px;overflow-y:auto;">
-      <div id="arb-log" style="color:var(--muted);white-space:pre-wrap;line-height:1.6"></div>
-    </div>
-  </div><!-- /tab-arb -->
-
-  <!-- ── Arbitrage tab ──────────────────────────────────────────────────── -->
-  <div id="tab-conviction" class="tab-pane">
-    <div id="conviction-error" class="error-box hidden"></div>
-
-    <!-- LIVE Conviction Trade Record (replaces arb area which barely fires) -->
-    <div class="card-group">
-      <p class="card-group-label">Conviction — LIVE Trade Record (Real CLOB Orders)</p>
-      <div class="cards">
-        <div class="card">
-          <div class="card-label">Mode</div>
-          <div class="card-value" id="conviction-mode">—</div>
-          <div class="card-sub" id="conviction-mode-detail">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Open Positions</div>
-          <div class="card-value neu" id="conviction-live-open">—</div>
-          <div class="card-sub" id="conviction-live-open-detail">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Closed Trades</div>
-          <div class="card-value" id="conviction-live-closed">—</div>
-          <div class="card-sub" id="conviction-live-closed-detail">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Win Rate</div>
-          <div class="card-value" id="conviction-live-wr">—</div>
-          <div class="card-sub">of settled live trades</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Live PnL</div>
-          <div class="card-value" id="conviction-live-pnl">—</div>
-          <div class="card-sub">real wallet movement</div>
-        </div>
-      </div>
-    </div>
-
-    <p class="section-title" id="conviction-recent-title">Live Trade Record (latest 50, open + settled)</p>
-    <div class="table-wrap" style="margin-bottom:20px;max-height:500px;overflow-y:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Symbol</th>
-            <th>TF</th>
-            <th>Dir</th>
-            <th>Skew</th>
-            <th>Entry</th>
-            <th>Tokens</th>
-            <th>USDC In</th>
-            <th>Fill</th>
-            <th>PnL</th>
-            <th>Order</th>
-            <th>Opened</th>
-          </tr>
-        </thead>
-        <tbody id="conviction-body"></tbody>
-      </table>
-    </div>
-
-    <p class="section-title">Live Performance by Symbol/Timeframe</p>
-    <div class="table-wrap" style="margin-bottom:20px;max-height:250px;overflow-y:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Symbol+TF</th>
-            <th>Settled</th>
-            <th>Wins</th>
-            <th>WR</th>
-            <th>PnL</th>
-          </tr>
-        </thead>
-        <tbody id="conviction-live-perf-body"></tbody>
-      </table>
-    </div>
-
-    <!-- ── PAPER SECTION (live now lives in the top trade record) ───────── -->
-    <hr style="margin: 40px 0; border: 1px solid #30363d;">
-
-    <!-- CONVICTION Paper Trading Section -->
-    <div class="card-group" style="margin-top: 30px;">
-      <p class="card-group-label">Conviction Signals — Paper Trading (Historical)</p>
-      <div class="cards">
-        <div class="card">
-          <div class="card-label">Open Positions</div>
-          <div class="card-value neu" id="conviction-conv-paper-open">—</div>
-          <div class="card-sub" id="conviction-conv-paper-open-detail">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Closed Trades</div>
-          <div class="card-value" id="conviction-conv-paper-closed">—</div>
-          <div class="card-sub" id="conviction-conv-paper-closed-detail">—</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Win Rate</div>
-          <div class="card-value" id="conviction-conv-paper-wr">—</div>
-          <div class="card-sub">of closed paper signals</div>
-        </div>
-        <div class="card">
-          <div class="card-label">Paper PnL</div>
-          <div class="card-value" id="conviction-conv-paper-pnl">—</div>
-          <div class="card-sub">simulated fills</div>
-        </div>
-      </div>
-    </div>
-
-    <p class="section-title">Paper Performance by Symbol/Timeframe</p>
-    <div class="table-wrap" style="margin-bottom:20px;max-height:250px;overflow-y:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Symbol+TF</th>
-            <th>Settled</th>
-            <th>Wins</th>
-            <th>WR</th>
-            <th>PnL</th>
-          </tr>
-        </thead>
-        <tbody id="conviction-paper-perf-body"></tbody>
-      </table>
-    </div>
-
-    <p class="section-title" id="conviction-paper-recent-title">Paper Trade Record (newest first)</p>
-    <div class="table-wrap" style="margin-bottom:20px;max-height:400px;overflow-y:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Symbol</th>
-            <th>TF</th>
-            <th>Dir</th>
-            <th>Skew</th>
-            <th>Entry</th>
-            <th>Tokens</th>
-            <th>USDC In</th>
-            <th>Fill</th>
-            <th>PnL</th>
-            <th>Order</th>
-            <th>Opened</th>
-          </tr>
-        </thead>
-        <tbody id="conviction-paper-body"></tbody>
-      </table>
-    </div>
-
-    <p class="section-title" id="conviction-conv-recent-title">Recent Conviction Signals (last 20)</p>
-    <div class="table-wrap" style="margin-bottom:20px;max-height:400px;overflow-y:auto;">
-      <table>
-        <thead>
-          <tr>
-            <th>Symbol</th>
-            <th>TF</th>
-            <th>Direction</th>
-            <th>Conviction</th>
-            <th>Entry Price</th>
-            <th>Bet Size</th>
-            <th>Timestamp</th>
-          </tr>
-        </thead>
-        <tbody id="conviction-conv-body"></tbody>
-      </table>
-    </div>
-  </div><!-- /tab-conviction -->
 
 </div>
 
@@ -1814,6 +1469,8 @@ _HTML = """\
   let catChart    = null;
   let pnlChart    = null;
   let pnlData     = [];  // module-level mirror of d.pnl_chart — keeps tooltip closure fresh
+  let swarmPnlChart = null;
+  let swarmPnlData  = [];  // module-level mirror of swarm d.pnl_chart
 
   const CAT_COLORS = {
     politics: { bg: "rgba(88,166,255,0.25)", border: "#58a6ff" },
@@ -1830,832 +1487,8 @@ _HTML = """\
   function fmtPct(v) { return parseFloat(v).toFixed(1) + "%"; }
   function pnlClass(v) { return v > 0 ? "pos" : v < 0 ? "neg" : "dim"; }
 
-  // ── Render ─────────────────────────────────────────────────────────────────
-  function render(d) {
-    // Error state
-    const errorBox = document.getElementById("error-box");
-    if (d.error) {
-      errorBox.textContent = "Error: " + d.error;
-      errorBox.classList.remove("hidden");
-      return;
-    }
-    errorBox.classList.add("hidden");
-
-    // Mode badge
-    const badge = document.getElementById("mode-badge");
-    badge.textContent = d.mode;
-    badge.className = "badge " + (d.mode === "VIRTUAL" ? "badge-virtual" : "badge-real");
-
-    // Last updated
-    const updEl = document.getElementById("updated-at");
-    if (d.last_updated) {
-      const dt = new Date(d.last_updated);
-      updEl.textContent = "Updated " + dt.toLocaleTimeString();
-    }
-
-    // ── Logical portfolio group ──────────────────────────────────────────────
-    // total = real_clob_balance + deployed — on-chain ground truth.
-    // unredeemed_ctf > 0 only when wins are settled virtually but not yet redeemed on-chain.
-    const portfolioEl = document.getElementById("c-budget");
-    portfolioEl.textContent = fmt$(d.total);
-    portfolioEl.className = "card-value " + pnlClass(d.net_pnl);
-
-    // Sub-line breakdown: Real CLOB | Unredeemed CTF | In bets
-    if (d.unredeemed_ctf > 0.01) {
-      document.getElementById("c-budget-breakdown").innerHTML =
-        "<span style='color:var(--blue)'>CLOB " + fmt$(d.real_clob_balance) + "</span>" +
-        " &nbsp;+&nbsp; " +
-        "<span style='color:var(--amber)'>Unredeemed CTF " + fmt$(d.unredeemed_ctf) + "</span>" +
-        (d.deployed > 0.01 ? " &nbsp;+&nbsp; <span style='color:var(--muted)'>Bets " + fmt$(d.deployed) + "</span>" : "");
-    } else {
-      document.getElementById("c-budget-breakdown").innerHTML =
-        "<span style='color:var(--blue)'>CLOB " + fmt$(d.real_clob_balance) + "</span>" +
-        (d.deployed > 0.01 ? " &nbsp;+&nbsp; <span style='color:var(--muted)'>Bets " + fmt$(d.deployed) + "</span>" : " — fully liquid");
-    }
-
-    // True PnL (real cash) — wallet change minus external deposits
-    const realPnlEl = document.getElementById("c-realpnl");
-    if (d.initial_real_clob && d.initial_real_clob > 0) {
-      realPnlEl.textContent = (d.real_pnl_all_time >= 0 ? "+" : "") + fmt$(d.real_pnl_all_time);
-      realPnlEl.className = "card-value " + pnlClass(d.real_pnl_all_time);
-      document.getElementById("c-realpnl-sub").textContent =
-        "start " + fmt$(d.initial_real_clob) +
-        " | deposits +" + fmt$(d.total_detected_deposits);
-    } else {
-      realPnlEl.textContent = "N/A";
-      realPnlEl.className = "card-value dim";
-    }
-
-    // Portfolio ROI — based on wallet balance change (real_pnl_all_time / total deposited).
-    // net_pnl from closed_positions is intentionally NOT shown here: it only reflects trades
-    // in the current state file and is permanently negative after the 2026-04-11 state corruption.
-    const cpnlEl = document.getElementById("c-cpnl");
-    const realRoi = d.real_roi_pct != null ? d.real_roi_pct : 0;
-    cpnlEl.textContent = (realRoi >= 0 ? "+" : "") + realRoi.toFixed(1) + "%";
-    cpnlEl.className = "card-value " + pnlClass(realRoi);
-    const roiEl = document.getElementById("c-roi");
-    roiEl.textContent = "trade P&L " + (d.net_pnl >= 0 ? "+" : "") + fmt$(d.net_pnl) +
-      " (" + d.closed_count + " trades, partial)";
-    roiEl.className = "card-sub " + pnlClass(d.net_pnl);
-
-    const dpnlEl = document.getElementById("c-dpnl");
-    dpnlEl.textContent = (d.daily_net_pnl >= 0 ? "+" : "") + fmt$(d.daily_net_pnl) + " net";
-    dpnlEl.className = "card-value " + pnlClass(d.daily_net_pnl);
-
-    const hitEl = document.getElementById("c-hit");
-    if (d.hit_rate !== null) {
-      hitEl.textContent = fmtPct(d.hit_rate);
-      hitEl.className = "card-value " + pnlClass(d.hit_rate - 50);
-    } else {
-      hitEl.textContent = "—";
-      hitEl.className = "card-value dim";
-    }
-    document.getElementById("c-closed").textContent = d.closed_count + " settled";
-
-    // ── 1H Crypto Loop stats (if available) ──────────────────────────────────
-    if (d.crypto_1h && !d.crypto_1h.error) {
-      const hr1h = document.querySelector(".card-group:last-of-type");
-      if (hr1h && !document.getElementById("crypto-1h-stats")) {
-        const statsDiv = document.createElement("div");
-        statsDiv.id = "crypto-1h-stats";
-        statsDiv.className = "card-group";
-        statsDiv.style.borderLeft = "3px solid #d29922";
-        const label = document.createElement("p");
-        label.className = "card-group-label";
-        label.textContent = "1H Crypto Loop (" + (d.crypto_1h.mode || "VIRTUAL") + ")";
-        statsDiv.appendChild(label);
-        const cardsDiv = document.createElement("div");
-        cardsDiv.className = "cards";
-        cardsDiv.innerHTML = `
-          <div class="card">
-            <div class="card-label">Closed Trades</div>
-            <div class="card-value">${d.crypto_1h.closed_trades || 0}</div>
-          </div>
-          <div class="card">
-            <div class="card-label">Hit Rate</div>
-            <div class="card-value" style="color:${d.crypto_1h.hit_rate >= 65 ? 'var(--green)' : 'var(--orange)'}">${d.crypto_1h.hit_rate ? d.crypto_1h.hit_rate.toFixed(1) + "%" : "—"}</div>
-          </div>
-          <div class="card">
-            <div class="card-label">PnL</div>
-            <div class="card-value" style="color:${d.crypto_1h.pnl >= 0 ? 'var(--green)' : 'var(--red)'}">${(d.crypto_1h.pnl >= 0 ? "+" : "") + fmt$(d.crypto_1h.pnl)}</div>
-          </div>
-        `;
-        statsDiv.appendChild(cardsDiv);
-        hr1h.parentNode.insertBefore(statsDiv, hr1h.nextSibling);
-      }
-    }
-
-    document.getElementById("c-pos").textContent = d.position_count;
-    document.getElementById("c-pos-usdc").textContent =
-      d.deployed > 0 ? fmt$(d.deployed) + " locked" : "none open";
-
-    // ── Real wallet group ────────────────────────────────────────────────────
-    // real_clob_balance = literal on-chain USDC.e (synced at startup + every 10 min AR check).
-    document.getElementById("c-avail").textContent = fmt$(d.real_clob_balance);
-    document.getElementById("c-avail").className = "card-value neu";
-    document.getElementById("c-avail-pct").textContent =
-      "synced every ~10 min";
-
-    const depEl = document.getElementById("c-deployed");
-    depEl.textContent = fmt$(d.deployed);
-    depEl.className = "card-value dim";
-    document.getElementById("c-deploy-pct").textContent =
-      fmtPct(d.deploy_pct) + " of CLOB balance";
-
-    // Start Capital = estimated total ever deposited = current total - net trading PnL.
-    // Updates automatically when new deposits are detected (balance jumps).
-    document.getElementById("c-total").textContent = fmt$(d.implied_deposited);
-
-    // ── Budget doughnut ──────────────────────────────────────────────────────
-    // Slices: logical balance (not at risk) + one slice per open-bet category
-    const cats = Object.keys(d.cat_deployed).sort();
-    const budgetLabels  = ["Logical Balance", ...cats.map(c => c.charAt(0).toUpperCase() + c.slice(1))];
-    const budgetData    = [d.available, ...cats.map(c => d.cat_deployed[c])];
-    const budgetColors  = [
-      "rgba(63,185,80,0.35)",
-      ...cats.map(c => catColor(c, "bg"))
-    ];
-    const budgetBorders = [
-      "#3fb950",
-      ...cats.map(c => catColor(c, "border"))
-    ];
-
-    if (budgetChart) {
-      budgetChart.data.labels = budgetLabels;
-      budgetChart.data.datasets[0].data    = budgetData;
-      budgetChart.data.datasets[0].backgroundColor = budgetColors;
-      budgetChart.data.datasets[0].borderColor      = budgetBorders;
-      budgetChart.update("none");
-    } else {
-      budgetChart = new Chart(document.getElementById("budget-chart"), {
-        type: "doughnut",
-        data: {
-          labels: budgetLabels,
-          datasets: [{
-            data: budgetData,
-            backgroundColor: budgetColors,
-            borderColor:     budgetBorders,
-            borderWidth: 2,
-            hoverOffset: 6,
-          }]
-        },
-        options: {
-          plugins: {
-            legend: {
-              position: "bottom",
-              labels: { color: "#8b949e", font: { size: 11 }, padding: 10, boxWidth: 12 }
-            },
-            tooltip: {
-              callbacks: {
-                label: ctx => " " + ctx.label + ": $" + ctx.raw.toFixed(2)
-              }
-            }
-          },
-          cutout: "60%",
-        }
-      });
-    }
-
-    // ── Category bar chart ───────────────────────────────────────────────────
-    if (cats.length > 0) {
-      const catLabels  = cats.map(c => c.charAt(0).toUpperCase() + c.slice(1));
-      const catValues  = cats.map(c => d.cat_deployed[c]);
-      const catBg      = cats.map(c => catColor(c, "bg"));
-      const catBorder  = cats.map(c => catColor(c, "border"));
-
-      if (catChart) {
-        catChart.data.labels = catLabels;
-        catChart.data.datasets[0].data            = catValues;
-        catChart.data.datasets[0].backgroundColor = catBg;
-        catChart.data.datasets[0].borderColor     = catBorder;
-        catChart.update("none");
-      } else {
-        catChart = new Chart(document.getElementById("cat-chart"), {
-          type: "bar",
-          data: {
-            labels: catLabels,
-            datasets: [{
-              label: "Deployed (USDC)",
-              data:            catValues,
-              backgroundColor: catBg,
-              borderColor:     catBorder,
-              borderWidth: 2,
-              borderRadius: 4,
-            }]
-          },
-          options: {
-            indexAxis: "y",
-            plugins: {
-              legend: { display: false },
-              tooltip: {
-                callbacks: { label: ctx => " $" + ctx.raw.toFixed(2) }
-              }
-            },
-            scales: {
-              x: {
-                grid:  { color: "rgba(255,255,255,0.06)" },
-                ticks: { color: "#8b949e", callback: v => "$" + v }
-              },
-              y: { ticks: { color: "#e6edf3" }, grid: { display: false } }
-            }
-          }
-        });
-      }
-    }
-
-    // ── Real-time PnL chart — per trade ─────────────────────────────────────
-    const pnlSection = document.getElementById("pnl-section");
-    if (d.pnl_chart && d.pnl_chart.length > 0) {
-      pnlData = d.pnl_chart;  // keep module-level ref fresh so tooltip closure is never stale
-      pnlSection.classList.remove("hidden");
-      document.getElementById("pnl-trade-count").textContent =
-        d.pnl_chart.length + " trades";
-
-      const pnlLabels = d.pnl_chart.map((_, i) => i + 1);
-      const pnlVals   = d.pnl_chart.map(e => (e.cumulative != null ? e.cumulative : null));
-
-      // Segment coloring: green when line is above zero, red when below
-      const segmentColor = ctx => {
-        const y0 = ctx.p0.parsed.y, y1 = ctx.p1.parsed.y;
-        if (y0 >= 0 && y1 >= 0) return "#3fb950";
-        if (y0 <  0 && y1 <  0) return "#f85149";
-        return "#8b949e"; // crossing zero — neutral
-      };
-      const lastVal = pnlVals[pnlVals.length - 1];
-      const fillColor = lastVal >= 0 ? "rgba(63,185,80,0.10)" : "rgba(248,81,73,0.10)";
-
-      if (pnlChart) {
-        pnlChart.data.labels = pnlLabels;
-        pnlChart.data.datasets[0].data = pnlVals;
-        pnlChart.data.datasets[0].backgroundColor = fillColor;
-        pnlChart.update("none");
-      } else {
-        pnlChart = new Chart(document.getElementById("pnl-chart"), {
-          type: "line",
-          data: {
-            labels: pnlLabels,
-            datasets: [{
-              label: "Cumulative PnL",
-              data: pnlVals,
-              segment: { borderColor: segmentColor },
-              backgroundColor: fillColor,
-              fill: true,
-              tension: 0.15,
-              pointRadius: 0,
-              pointHoverRadius: 5,
-              pointHoverBackgroundColor: ctx => {
-                const e = pnlData[ctx.dataIndex];
-                return e && e.trade_pnl > 0 ? "#3fb950" : "#f85149";
-              },
-              borderWidth: 2,
-            }]
-          },
-          options: {
-            animation: false,
-            interaction: { mode: "index", intersect: false },
-            plugins: {
-              legend: { display: false },
-              tooltip: {
-                callbacks: {
-                  title: ctx => {
-                    const e = pnlData[ctx[0].dataIndex];
-                    if (!e) return "";
-                    return "#" + (ctx[0].dataIndex + 1) + "  " + (e.label || "");
-                  },
-                  label: ctx => {
-                    const e = pnlData[ctx.dataIndex];
-                    if (!e) return "";
-                    const sign = e.trade_pnl >= 0 ? "+" : "";
-                    return [
-                      " " + (e.title || "").slice(0, 40),
-                      " Trade PnL: " + sign + "$" + e.trade_pnl.toFixed(2),
-                      " Cumulative: $" + (e.cumulative != null ? e.cumulative.toFixed(2) : "—"),
-                    ];
-                  }
-                }
-              }
-            },
-            scales: {
-              x: {
-                ticks: {
-                  color: "#8b949e",
-                  maxTicksLimit: 10,
-                  callback: (v, i) => {
-                    // Show trade number, not date — dates crowd at this volume
-                    return "#" + (i + 1);
-                  }
-                },
-                grid: { color: "rgba(255,255,255,0.04)" }
-              },
-              y: {
-                ticks: { color: "#8b949e", callback: v => v != null ? "$" + v.toFixed(0) : "" },
-                grid: {
-                  color: ctx => ctx.tick.value === 0
-                    ? "rgba(255,255,255,0.25)"   // bright zero line
-                    : "rgba(255,255,255,0.06)",
-                },
-                afterDataLimits: axis => {
-                  if (axis.max < 0) axis.max = 0;
-                  if (axis.min > 0) axis.min = 0;
-                },
-              }
-            }
-          }
-        });
-      }
-    } else {
-      pnlSection.classList.add("hidden");
-    }
-
-    // ── Open positions table ──────────────────────────────────────────────────
-    const posTitle = document.getElementById("pos-title");
-    posTitle.textContent = "Open Positions (" + d.position_count + ")";
-
-    const tbody = document.getElementById("pos-body");
-    tbody.innerHTML = "";
-    d.positions.forEach((p, i) => {
-      const cat = (p.category || "other").toLowerCase();
-      const dir = p.direction === "YES" ? "YES" : "NO";
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        "<td>" + (i + 1) + "</td>" +
-        "<td class='title-cell' title='" + escHtml(p.title) + "'>" + escHtml(p.title) + "</td>" +
-        "<td><span class='cat cat-" + cat + "'>" + cat + "</span></td>" +
-        "<td class='" + (dir === "YES" ? "dir-yes" : "dir-no") + "'>" + dir + "</td>" +
-        "<td>$" + parseFloat(p.size_usdc).toFixed(2) + "</td>" +
-        "<td>" + parseFloat(p.fill_price).toFixed(4) + "</td>" +
-        "<td>" + (p.age_days || "—") + "</td>";
-      tbody.appendChild(tr);
-    });
-
-    // ── Closed positions table ────────────────────────────────────────────────
-    const closedSection = document.getElementById("closed-section");
-    if (d.closed_positions && d.closed_positions.length > 0) {
-      closedSection.classList.remove("hidden");
-      const cb = document.getElementById("closed-body");
-      cb.innerHTML = "";
-      d.closed_positions.forEach((p, i) => {
-        const pnl = parseFloat(p.realized_pnl || 0);
-        const fill = parseFloat(p.fill_price || 0);
-        const outcome = p.outcome === 1 ? "YES ✓" : p.outcome === 0 ? "NO ✓" : "—";
-        const fillNote = fill > 0 ? fill.toFixed(3) : "—";
-        let closedAt = "—";
-        if (p.settle_time) {
-          try {
-            const dt = new Date(p.settle_time);
-            closedAt = dt.toLocaleString([], {month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"});
-          } catch(e) {}
-        }
-        const tr = document.createElement("tr");
-        tr.innerHTML =
-          "<td>" + (i + 1) + "</td>" +
-          "<td class='title-cell' title='" + escHtml(p.title) + "'>" + escHtml(p.title) + "</td>" +
-          "<td class='" + (p.direction === "YES" ? "dir-yes" : "dir-no") + "'>" + p.direction + "</td>" +
-          "<td>$" + parseFloat(p.size_usdc).toFixed(2) + "</td>" +
-          "<td style='color:var(--muted);font-size:12px'>" + fillNote + "</td>" +
-          "<td>" + outcome + "</td>" +
-          "<td class='" + pnlClass(pnl) + "'>" + (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(2) + "</td>" +
-          "<td style='font-size:11px;color:var(--muted);white-space:nowrap'>" + closedAt + "</td>";
-        cb.appendChild(tr);
-      });
-    } else {
-      closedSection.classList.add("hidden");
-    }
-  }
-
   function escHtml(str) {
     return String(str).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;");
-  }
-
-  // ── Tab switching ─────────────────────────────────────────────────────────
-  let _activeTab = "crypto";
-  function switchTab(name) {
-    _activeTab = name;
-    document.querySelectorAll(".tab-btn").forEach(b =>
-      b.classList.toggle("active", b.getAttribute("onclick").includes("'" + name + "'"))
-    );
-    document.querySelectorAll(".tab-pane").forEach(p =>
-      p.classList.toggle("active", p.id === "tab-" + name)
-    );
-    if (name === "swarm") fetchSwarm();
-    else if (name === "arb") fetchArb();
-    else if (name === "conviction") fetchConviction();
-    else { fetchData(); fetchWallet(); }
-  }
-
-  // ── True wallet (on-chain) rendering ──────────────────────────────────────
-  function renderWallet(d) {
-    if (d.error) {
-      document.getElementById("w-total").textContent = "ERR";
-      document.getElementById("w-total-sub").textContent = d.error;
-      return;
-    }
-    document.getElementById("w-total").textContent = "$" + d.total_recoverable.toFixed(2);
-    document.getElementById("w-total-sub").textContent =
-      "cash $" + d.cash_usdc.toFixed(2) +
-      " + pending $" + d.won_pending.toFixed(2) +
-      " + in-play $" + d.in_play_curval.toFixed(2);
-
-    document.getElementById("w-cash").textContent = "$" + d.cash_usdc.toFixed(2);
-    document.getElementById("w-pol").textContent = d.pol_balance.toFixed(4) + " POL gas";
-
-    document.getElementById("w-pending").textContent = "$" + d.won_pending.toFixed(2);
-    document.getElementById("w-pending-cnt").textContent =
-      d.counts.won_pending + " market" + (d.counts.won_pending === 1 ? "" : "s") +
-      " · resolved, awaiting UMA finalize";
-
-    document.getElementById("w-redeem").textContent = "$" + d.won_redeemable.toFixed(2);
-    document.getElementById("w-redeem-cnt").textContent =
-      d.counts.won_redeemable + " market" + (d.counts.won_redeemable === 1 ? "" : "s") +
-      " · AR sweeps next cycle";
-
-    document.getElementById("w-inplay-cur").textContent = "$" + d.in_play_curval.toFixed(2);
-    document.getElementById("w-inplay-face").textContent =
-      "face $" + d.in_play_face.toFixed(2) + " · " + d.counts.in_play + " markets";
-
-    document.getElementById("w-lost").textContent = "$" + d.lost_face.toFixed(2);
-    document.getElementById("w-lost-cnt").textContent =
-      d.counts.lost + " markets · written off (cumulative)";
-  }
-
-  async function fetchWallet() {
-    try {
-      const res = await fetch("/api/wallet");
-      const data = await res.json();
-      renderWallet(data);
-    } catch (e) {
-      document.getElementById("w-total").textContent = "—";
-      document.getElementById("w-total-sub").textContent = "fetch failed: " + e.message;
-    }
-  }
-
-  // ── Strike rendering ──────────────────────────────────────────────────────
-  function renderConviction(d) {
-    const errEl = document.getElementById("conviction-error");
-    if (d.error) {
-      errEl.textContent = d.error;
-      errEl.classList.remove("hidden");
-      return;
-    }
-    errEl.classList.add("hidden");
-
-    // Mode card
-    const modeEl = document.getElementById("conviction-mode");
-    const mode = d.mode || "VIRTUAL";
-    modeEl.textContent = mode;
-    modeEl.className = "card-value " + (mode === "LIVE" ? "pos" : "neu");
-    document.getElementById("conviction-mode-detail").textContent =
-      mode === "LIVE" ? "$" + (d.real_clob_balance || 0).toFixed(2) + " on CLOB" : "paper trading";
-
-    // ── LIVE CONVICTION Summary Cards (was arb area) ─────────────────────────
-    const liveOpen   = d.conv_live_open_count   || 0;
-    const liveClosed = d.conv_live_closed_count || 0;
-    const liveHits   = d.conv_live_hits         || 0;
-    const liveWr     = d.conv_live_hit_rate;  // may be null when 0 settled
-    const livePnl    = d.conv_live_pnl          || 0;
-    const liveOpenUsdc = d.conv_live_open_usdc  || 0;
-
-    document.getElementById("conviction-live-open").textContent = String(liveOpen);
-    document.getElementById("conviction-live-open-detail").textContent =
-      liveOpen > 0 ? ("$" + liveOpenUsdc.toFixed(2) + " committed") : "no open positions";
-
-    document.getElementById("conviction-live-closed").textContent = String(liveClosed);
-    const liveWrText = (liveWr !== null && liveWr !== undefined)
-      ? liveHits + "W / " + Math.max(0, liveClosed - liveHits) + "L"
-      : "0 settled";
-    document.getElementById("conviction-live-closed-detail").textContent = liveWrText;
-
-    const liveWrEl = document.getElementById("conviction-live-wr");
-    liveWrEl.textContent = (liveWr !== null && liveWr !== undefined) ? liveWr.toFixed(1) + "%" : "—";
-    liveWrEl.className = "card-value " + (liveWr && liveWr >= 60 ? "pos" : liveWr ? "neu" : "dim");
-
-    const livePnlEl = document.getElementById("conviction-live-pnl");
-    livePnlEl.textContent = (livePnl >= 0 ? "+" : "") + "$" + livePnl.toFixed(2);
-    livePnlEl.className = "card-value " + pnlClass(livePnl);
-
-    // ── Live Trade Record table ─────────────────────────────────────────────
-    document.getElementById("conviction-recent-title").textContent =
-      "Live Trade Record (" + (d.conv_live_trade_record || []).length + ", newest first)";
-    const tbody = document.getElementById("conviction-body");
-    tbody.innerHTML = "";
-    (d.conv_live_trade_record || []).forEach(t => {
-      const tr = document.createElement("tr");
-      const tsRaw = (t.opened_at || 0);
-      const tsShort = tsRaw > 0 ? new Date(tsRaw * 1000).toISOString().replace("T", " ").substring(5, 19) : "—";
-      const statusCls = t.status === "WIN" ? "pos" : t.status === "LOSS" ? "neg" : "neu";
-      const dirCls = t.direction === "UP" ? "pos" : "neg";
-      const pnlCls = pnlClass(t.pnl);
-      const orderShort = (t.order_id || "").substring(0, 10);
-      const invertTag = t.inverted ? " <span class='neg' style='font-size:10px'>INV</span>" : "";
-      const fillCell = t.fill_type ? ("<td class='dim' style='font-size:11px'>" + t.fill_type + "</td>") : "<td class='dim'>—</td>";
-      tr.innerHTML =
-        "<td class='" + statusCls + "'><strong>" + t.status + "</strong></td>" +
-        "<td>" + t.symbol + invertTag + "</td>" +
-        "<td>" + t.timeframe + "</td>" +
-        "<td class='" + dirCls + "'>" + t.direction + "</td>" +
-        "<td>" + ((t.conviction || 0) * 100).toFixed(1) + "%</td>" +
-        "<td>$" + (t.entry_price || 0).toFixed(3) + "</td>" +
-        "<td>" + (t.tokens || 0).toFixed(2) + "</td>" +
-        "<td>$" + (t.filled_usdc || 0).toFixed(2) + "</td>" +
-        fillCell +
-        "<td class='" + pnlCls + "'>" + (t.status === "OPEN" ? "—" : ((t.pnl >= 0 ? "+" : "") + "$" + (t.pnl || 0).toFixed(2))) + "</td>" +
-        "<td class='dim' style='font-size:10px;font-family:monospace'>" + orderShort + "</td>" +
-        "<td class='dim' style='font-size:11px'>" + tsShort + "</td>";
-      tbody.appendChild(tr);
-    });
-    if ((d.conv_live_trade_record || []).length === 0) {
-      tbody.innerHTML = "<tr><td colspan='12' class='dim' style='text-align:center'>No live trades yet — waiting for first signal</td></tr>";
-    }
-
-    // Live performance by symbol/timeframe
-    const livePerf = document.getElementById("conviction-live-perf-body");
-    livePerf.innerHTML = "";
-    const liveSymTf = d.conv_live_by_symbol_tf || {};
-    Object.entries(liveSymTf).forEach(([stf, stats]) => {
-      const tr = document.createElement("tr");
-      const wins = stats.wins || 0;
-      const total = stats.trades || 1;
-      const wr = ((wins / total) * 100).toFixed(1);
-      const wrCls = wr >= 60 ? "pos" : wr >= 50 ? "neu" : "neg";
-      const pnlCls = pnlClass(stats.pnl || 0);
-      tr.innerHTML =
-        "<td><strong>" + stf + "</strong></td>" +
-        "<td>" + total + "</td>" +
-        "<td>" + wins + "</td>" +
-        "<td class='" + wrCls + "'>" + wr + "%</td>" +
-        "<td class='" + pnlCls + "'>" + (stats.pnl >= 0 ? "+" : "") + "$" + (stats.pnl || 0).toFixed(2) + "</td>";
-      livePerf.appendChild(tr);
-    });
-    if (Object.keys(liveSymTf).length === 0) {
-      livePerf.innerHTML = "<tr><td colspan='5' class='dim' style='text-align:center'>No settled live trades yet</td></tr>";
-    }
-
-    // ── PAPER CONVICTION rendering (bottom section) ──────────────────────────
-
-    // CONVICTION PAPER Trading Cards
-    const convPaperOpen = d.conv_paper_open_count !== undefined ? d.conv_paper_open_count : 0;
-    const convPaperClosed = d.conv_paper_closed_count !== undefined ? d.conv_paper_closed_count : 0;
-    const convPaperHits = d.conv_paper_hits !== undefined ? d.conv_paper_hits : 0;
-    const convPaperWr = d.conv_paper_hit_rate !== undefined && d.conv_paper_hit_rate !== null ? d.conv_paper_hit_rate : null;
-    const convPaperPnl = d.conv_paper_pnl !== undefined ? d.conv_paper_pnl : 0;
-
-    document.getElementById("conviction-conv-paper-open").textContent = String(convPaperOpen);
-    document.getElementById("conviction-conv-paper-open-detail").textContent = "paper positions";
-
-    document.getElementById("conviction-conv-paper-closed").textContent = String(convPaperClosed);
-    const convPaperWrText = convPaperWr !== null ? convPaperHits + "W / " + Math.max(0, convPaperClosed - convPaperHits) + "L" : "0 settled";
-    document.getElementById("conviction-conv-paper-closed-detail").textContent = convPaperWrText;
-
-    const convPaperWrEl = document.getElementById("conviction-conv-paper-wr");
-    convPaperWrEl.textContent = convPaperWr !== null ? convPaperWr.toFixed(1) + "%" : "—";
-    convPaperWrEl.className = "card-value " + (convPaperWr && convPaperWr >= 65 ? "pos" : convPaperWr ? "neu" : "dim");
-
-    const convPaperPnlEl = document.getElementById("conviction-conv-paper-pnl");
-    convPaperPnlEl.textContent = (convPaperPnl >= 0 ? "+" : "") + "$" + convPaperPnl.toFixed(2);
-    convPaperPnlEl.className = "card-value " + pnlClass(convPaperPnl);
-
-    // Paper performance by symbol/timeframe (mirror of live table)
-    const paperPerf = document.getElementById("conviction-paper-perf-body");
-    paperPerf.innerHTML = "";
-    const paperSymTf = d.conv_paper_by_symbol_tf || {};
-    Object.entries(paperSymTf).forEach(([stf, stats]) => {
-      const tr = document.createElement("tr");
-      const wins = stats.wins || 0;
-      const total = stats.trades || 1;
-      const wr = ((wins / total) * 100).toFixed(1);
-      const wrCls = wr >= 60 ? "pos" : wr >= 50 ? "neu" : "neg";
-      const pnlCls = pnlClass(stats.pnl || 0);
-      tr.innerHTML =
-        "<td><strong>" + stf + "</strong></td>" +
-        "<td>" + total + "</td>" +
-        "<td>" + wins + "</td>" +
-        "<td class='" + wrCls + "'>" + wr + "%</td>" +
-        "<td class='" + pnlCls + "'>" + (stats.pnl >= 0 ? "+" : "") + "$" + (stats.pnl || 0).toFixed(2) + "</td>";
-      paperPerf.appendChild(tr);
-    });
-    if (Object.keys(paperSymTf).length === 0) {
-      paperPerf.innerHTML = "<tr><td colspan='5' class='dim' style='text-align:center'>No settled paper trades yet</td></tr>";
-    }
-
-    // ── Paper Trade Record table ─────────────────────────────────────────────
-    document.getElementById("conviction-paper-recent-title").textContent =
-      "Paper Trade Record (" + (d.conv_paper_trade_record || []).length + ", newest first)";
-    const paperTbody = document.getElementById("conviction-paper-body");
-    paperTbody.innerHTML = "";
-    (d.conv_paper_trade_record || []).forEach(t => {
-      const tr = document.createElement("tr");
-      const tsRaw = (t.opened_at || 0);
-      const tsShort = tsRaw > 0 ? new Date(tsRaw * 1000).toISOString().replace("T", " ").substring(5, 19) : "—";
-      const statusCls = t.status === "WIN" ? "pos" : t.status === "LOSS" ? "neg" : "neu";
-      const dirCls = t.direction === "UP" ? "pos" : "neg";
-      const pnlCls = pnlClass(t.pnl);
-      const orderShort = (t.order_id || "").substring(0, 10);
-      const invertTag = t.inverted ? " <span class='neg' style='font-size:10px'>INV</span>" : "";
-      const fillCell = t.fill_type ? ("<td class='dim' style='font-size:11px'>" + t.fill_type + "</td>") : "<td class='dim'>—</td>";
-      tr.innerHTML =
-        "<td class='" + statusCls + "'><strong>" + t.status + "</strong></td>" +
-        "<td>" + t.symbol + invertTag + "</td>" +
-        "<td>" + t.timeframe + "</td>" +
-        "<td class='" + dirCls + "'>" + t.direction + "</td>" +
-        "<td>" + ((t.conviction || 0) * 100).toFixed(1) + "%</td>" +
-        "<td>$" + (t.entry_price || 0).toFixed(3) + "</td>" +
-        "<td>" + (t.tokens || 0).toFixed(2) + "</td>" +
-        "<td>$" + (t.filled_usdc || 0).toFixed(2) + "</td>" +
-        fillCell +
-        "<td class='" + pnlCls + "'>" + (t.status === "OPEN" ? "—" : ((t.pnl >= 0 ? "+" : "") + "$" + (t.pnl || 0).toFixed(2))) + "</td>" +
-        "<td class='dim' style='font-size:10px;font-family:monospace'>" + orderShort + "</td>" +
-        "<td class='dim' style='font-size:11px'>" + tsShort + "</td>";
-      paperTbody.appendChild(tr);
-    });
-    if ((d.conv_paper_trade_record || []).length === 0) {
-      paperTbody.innerHTML = "<tr><td colspan='12' class='dim' style='text-align:center'>No paper trades yet</td></tr>";
-    }
-
-    // Conviction signals recent table
-    document.getElementById("conviction-conv-recent-title").textContent =
-      "Recent Conviction Signals (" + (d.conv_recent_signals || []).length + ")";
-    const convBody = document.getElementById("conviction-conv-body");
-    convBody.innerHTML = "";
-    (d.conv_recent_signals || []).forEach(t => {
-      const tr = document.createElement("tr");
-      const dirCls = t.direction === "UP" ? "pos" : "neg";
-      const tsShort = (t.timestamp || "").replace("T", " ").substring(0, 19);
-      tr.innerHTML =
-        "<td>" + (t.symbol || "?") + "</td>" +
-        "<td>" + (t.timeframe || "?") + "</td>" +
-        "<td class='" + dirCls + "'>" + (t.direction || "?") + "</td>" +
-        "<td>" + ((t.conviction || 0) * 100).toFixed(0) + "%</td>" +
-        "<td>$" + (t.entry_price || 0).toFixed(3) + "</td>" +
-        "<td>$" + (t.bet || 0).toFixed(2) + "</td>" +
-        "<td class='dim' style='font-size:11px'>" + tsShort + "</td>";
-      convBody.appendChild(tr);
-    });
-    if ((d.conv_recent_signals || []).length === 0) {
-      convBody.innerHTML = "<tr><td colspan='7' class='dim' style='text-align:center'>No conviction signals yet</td></tr>";
-    }
-  }
-
-  async function fetchConviction() {
-    try {
-      const res = await fetch("/api/conviction?t=" + Date.now());
-      const data = await res.json();
-      try {
-        renderConviction(data);
-      } catch (e) {
-        var gel = document.getElementById("global-js-error");
-        if (gel) { gel.style.display = "block"; gel.textContent = "renderConviction() error: " + e.message; }
-      }
-    } catch (e) {
-      document.getElementById("conviction-error").textContent = "Failed to fetch conviction data: " + e.message;
-      document.getElementById("conviction-error").classList.remove("hidden");
-    }
-  }
-
-  // ── Arb rendering ─────────────────────────────────────────────────────────
-  function renderArb(d) {
-    const ARB_THRESHOLD_APY = d.entry_threshold_apy || 5.48; // read from config
-    const errEl = document.getElementById("arb-error");
-    if (d.error) {
-      errEl.textContent = d.error;
-      errEl.classList.remove("hidden");
-      return;
-    }
-    errEl.classList.add("hidden");
-
-    // Status
-    const statusEl = document.getElementById("arb-status");
-    statusEl.textContent = d.status || "IDLE";
-    statusEl.className = "card-value " + (d.status === "ACTIVE" ? "pos" : "neu");
-    const arbModeEl = document.getElementById("arb-mode-sub");
-    const arbMode = d.mode || "VIRTUAL";
-    arbModeEl.textContent = arbMode + " mode";
-    arbModeEl.style.color = arbMode === "LIVE" ? "var(--green)" : "var(--blue)";
-
-    // Funding collected
-    const funding = d.total_funding_collected || 0;
-    const fundEl = document.getElementById("arb-funding");
-    fundEl.textContent = (funding >= 0 ? "+" : "") + "$" + funding.toFixed(4);
-    fundEl.className = "card-value " + pnlClass(funding);
-    document.getElementById("arb-trades").textContent = (d.trade_count || 0) + " cycles";
-
-    // Realized PnL
-    const pnl = d.total_realized_pnl || 0;
-    const pnlEl = document.getElementById("arb-pnl");
-    pnlEl.textContent = (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(4);
-    pnlEl.className = "card-value " + pnlClass(pnl);
-
-    // Active symbol + position details
-    const activeSym = d.active_symbol || "";
-    const symEl = document.getElementById("arb-active-symbol");
-    if (activeSym) {
-      symEl.textContent = activeSym.replace("USDT", "");
-      symEl.className = "card-value pos";
-    } else {
-      symEl.textContent = "—";
-      symEl.className = "card-value dim";
-    }
-    const qty = d.spot_qty || 0;
-    const baseAsset = activeSym ? activeSym.replace("USDT", "") : "—";
-    document.getElementById("arb-qty").textContent =
-      qty > 0 ? qty.toFixed(5) + " " + baseAsset + " each leg" : "no open position";
-
-    const entry = d.entry_price || 0;
-    const cur = d.current_price || 0;
-    const entryEl = document.getElementById("arb-entry");
-    if (entry > 0 && cur > 0) {
-      entryEl.textContent = "$" + entry.toFixed(2) + " → $" + cur.toFixed(2);
-      const drift = cur - entry;
-      entryEl.className = "card-value " + (Math.abs(drift) < 0.10 ? "dim" : drift > 0 ? "pos" : "neg");
-    } else if (entry > 0) {
-      entryEl.textContent = "$" + entry.toFixed(2);
-      entryEl.className = "card-value dim";
-    } else {
-      entryEl.textContent = "—";
-      entryEl.className = "card-value dim";
-    }
-    if (d.entry_time && d.entry_time > 0) {
-      const ageSec = Math.round((Date.now() / 1000) - d.entry_time);
-      const absAge = Math.abs(ageSec);
-      const ageStr = absAge > 3600
-        ? (absAge / 3600).toFixed(1) + "h"
-        : absAge > 60 ? Math.round(absAge / 60) + "m" : absAge + "s";
-      document.getElementById("arb-age").textContent = "open " + ageStr;
-    } else {
-      document.getElementById("arb-age").textContent = "not in position";
-    }
-
-    // Pending funding + errors
-    const pending = d.pending_funding || 0;
-    const pendEl = document.getElementById("arb-pending");
-    pendEl.textContent = pending > 0 ? "+$" + pending.toFixed(4) : "—";
-    pendEl.className = "card-value " + (pending > 0 ? "pos" : "dim");
-    const errCount = d.error_count || 0;
-    document.getElementById("arb-errors-sub").textContent = errCount + " error" + (errCount === 1 ? "" : "s");
-
-    // Live rates table
-    const ratesBody = document.getElementById("arb-rates-body");
-    ratesBody.innerHTML = "";
-    const rates = d.current_rates || {};
-    const syms = Object.keys(rates).sort();
-    if (syms.length === 0) {
-      const tr = document.createElement("tr");
-      tr.innerHTML = "<td colspan='5' style='color:var(--muted);text-align:center;padding:12px'>No rate data yet — waiting for first scan</td>";
-      ratesBody.appendChild(tr);
-    } else {
-      syms.forEach(sym => {
-        const r = rates[sym];
-        const apy = r.apy;
-        const absApy = Math.abs(apy);
-        const isPos = apy > 0;
-        const isNeg = apy < 0;
-        const color = isPos ? "var(--green)" : isNeg ? "var(--red)" : "var(--muted)";
-        const direction = isPos ? "LONGS PAY ▲" : isNeg ? "SHORTS PAY ▼" : "NEUTRAL";
-        const dirColor = isPos ? "var(--green)" : isNeg ? "var(--red)" : "var(--muted)";
-        // threshold bar: % of ±10.95% threshold
-        const barPct = Math.min(100, (absApy / ARB_THRESHOLD_APY) * 100).toFixed(0);
-        const barColor = absApy >= ARB_THRESHOLD_APY ? "var(--green)" : isNeg ? "var(--red)" : "var(--blue)";
-        const isActive = sym === (d.active_symbol || "");
-        const tr = document.createElement("tr");
-        if (isActive) tr.style.background = "rgba(63,185,80,0.07)";
-        tr.innerHTML =
-          "<td style='font-weight:600'>" + sym.replace("USDT", "") +
-            (isActive ? " <span style='font-size:10px;color:var(--green)'>● ACTIVE</span>" : "") + "</td>" +
-          "<td style='color:" + color + ";font-family:monospace'>" + r.rate.toFixed(6) + "</td>" +
-          "<td style='color:" + color + ";font-weight:600'>" + (isNeg ? "" : "+") + apy.toFixed(1) + "%</td>" +
-          "<td style='color:" + dirColor + ";font-size:12px'>" + direction + "</td>" +
-          "<td style='width:180px'>" +
-            "<div style='display:flex;align-items:center;gap:8px'>" +
-              "<div style='flex:1;background:var(--border);border-radius:3px;height:6px'>" +
-                "<div style='width:" + barPct + "%;background:" + barColor + ";height:6px;border-radius:3px'></div>" +
-              "</div>" +
-              "<span style='font-size:11px;color:var(--muted);white-space:nowrap'>" + barPct + "%</span>" +
-            "</div>" +
-          "</td>";
-        ratesBody.appendChild(tr);
-      });
-    }
-
-    // Log
-    const logEl = document.getElementById("arb-log");
-    const lines = d.recent_log || [];
-    logEl.textContent = lines.length > 0 ? lines.join("\\n") : "No log entries yet.";
-    logEl.scrollTop = logEl.scrollHeight;
-  }
-
-  async function fetchArb() {
-    try {
-      const res = await fetch("/api/arb");
-      const data = await res.json();
-      try {
-        renderArb(data);
-      } catch (e) {
-        var gel = document.getElementById("global-js-error");
-        if (gel) { gel.style.display = "block"; gel.textContent = "renderArb() error: " + e.message + " — " + (e.stack || "").split("\\n")[1]; }
-      }
-    } catch (e) {
-      document.getElementById("arb-error").textContent = "Failed to fetch arb data: " + e.message;
-      document.getElementById("arb-error").classList.remove("hidden");
-    }
   }
 
   // ── Swarm rendering ───────────────────────────────────────────────────────
@@ -2667,6 +1500,48 @@ _HTML = """\
       return;
     }
     errEl.classList.add("hidden");
+
+    // Mode badge + last-updated (this is the live AI-swarm strategy)
+    const badge = document.getElementById("mode-badge");
+    if (badge) { badge.textContent = "LIVE"; badge.className = "badge badge-real"; }
+    if (d.last_updated) {
+      const uel = document.getElementById("updated-at");
+      if (uel) uel.textContent = "Updated " + new Date(d.last_updated).toLocaleTimeString();
+    }
+
+    // ── Total portfolio (on-chain) ─────────────────────────────────────────────
+    const w = d.wallet || {};
+    const wc = w.counts || {};
+    if (w.error) {
+      document.getElementById("w-total").textContent = "ERR";
+      document.getElementById("w-total-sub").textContent = w.error;
+    } else {
+      document.getElementById("w-total").textContent = "$" + (w.total_recoverable || 0).toFixed(2);
+      document.getElementById("w-total-sub").textContent =
+        "cash $" + (w.cash_usdc || 0).toFixed(2) +
+        " + redeem $" + (w.won_redeemable || 0).toFixed(2) +
+        " + pending $" + (w.won_pending || 0).toFixed(2) +
+        " + in-play $" + (w.in_play_curval || 0).toFixed(2);
+
+      document.getElementById("w-cash").textContent = "$" + (w.cash_usdc || 0).toFixed(2);
+      document.getElementById("w-pol").textContent = (w.pol_balance || 0).toFixed(4) + " POL gas";
+
+      document.getElementById("w-redeem").textContent = "$" + (w.won_redeemable || 0).toFixed(2);
+      document.getElementById("w-redeem-cnt").textContent =
+        (wc.won_redeemable || 0) + " market" + ((wc.won_redeemable === 1) ? "" : "s") + " · AR sweeps next cycle";
+
+      document.getElementById("w-pending").textContent = "$" + (w.won_pending || 0).toFixed(2);
+      document.getElementById("w-pending-cnt").textContent =
+        (wc.won_pending || 0) + " market" + ((wc.won_pending === 1) ? "" : "s") + " · resolved, awaiting UMA finalize";
+
+      document.getElementById("w-inplay-cur").textContent = "$" + (w.in_play_curval || 0).toFixed(2);
+      document.getElementById("w-inplay-face").textContent =
+        "face $" + (w.in_play_face || 0).toFixed(2) + " · " + (wc.in_play || 0) + " markets";
+
+      document.getElementById("w-lost").textContent = "$" + (w.lost_face || 0).toFixed(2);
+      document.getElementById("w-lost-cnt").textContent =
+        (wc.lost || 0) + " markets · written off (cumulative)";
+    }
 
     // ── Era-split cards (live strategy = NO only) ──────────────────────────────
     function _setVal(elId, val, fmt, cls) {
@@ -2866,81 +1741,105 @@ _HTML = """\
       srClosedSec.classList.add("hidden");
     }
 
-    // ── Paper analysis cards ───────────────────────────────────────────────────
-    const wrEl = document.getElementById("s-wr");
-    if (d.win_rate !== null && d.win_rate !== undefined) {
-      wrEl.textContent = d.win_rate.toFixed(1) + "%";
-      wrEl.className = "card-value " + pnlClass(d.win_rate - 50);
+    // ── Real-time PnL chart (NO-only equity curve) ─────────────────────────────
+    const spSection = document.getElementById("swarm-pnl-section");
+    const chart = d.pnl_chart || [];
+    if (chart.length > 0) {
+      swarmPnlData = chart;  // keep module ref fresh for tooltip closure
+      spSection.classList.remove("hidden");
+      document.getElementById("swarm-pnl-trade-count").textContent =
+        chart.length + " settled NO trades";
+
+      const labels = chart.map((_, i) => i + 1);
+      const vals   = chart.map(e => (e.cumulative != null ? e.cumulative : null));
+
+      const segmentColor = ctx => {
+        const y0 = ctx.p0.parsed.y, y1 = ctx.p1.parsed.y;
+        if (y0 >= 0 && y1 >= 0) return "#3fb950";
+        if (y0 <  0 && y1 <  0) return "#f85149";
+        return "#8b949e";
+      };
+      const lastVal = vals[vals.length - 1];
+      const fillColor = lastVal >= 0 ? "rgba(63,185,80,0.10)" : "rgba(248,81,73,0.10)";
+
+      if (swarmPnlChart) {
+        swarmPnlChart.data.labels = labels;
+        swarmPnlChart.data.datasets[0].data = vals;
+        swarmPnlChart.data.datasets[0].backgroundColor = fillColor;
+        swarmPnlChart.update("none");
+      } else {
+        swarmPnlChart = new Chart(document.getElementById("swarm-pnl-chart"), {
+          type: "line",
+          data: {
+            labels: labels,
+            datasets: [{
+              label: "Cumulative PnL",
+              data: vals,
+              segment: { borderColor: segmentColor },
+              backgroundColor: fillColor,
+              fill: true,
+              tension: 0.15,
+              pointRadius: 0,
+              pointHoverRadius: 5,
+              pointHoverBackgroundColor: ctx => {
+                const e = swarmPnlData[ctx.dataIndex];
+                return e && e.trade_pnl > 0 ? "#3fb950" : "#f85149";
+              },
+              borderWidth: 2,
+            }]
+          },
+          options: {
+            animation: false,
+            interaction: { mode: "index", intersect: false },
+            plugins: {
+              legend: { display: false },
+              tooltip: {
+                callbacks: {
+                  title: ctx => {
+                    const e = swarmPnlData[ctx[0].dataIndex];
+                    if (!e) return "";
+                    return "#" + (ctx[0].dataIndex + 1) + "  " + (e.label || "");
+                  },
+                  label: ctx => {
+                    const e = swarmPnlData[ctx.dataIndex];
+                    if (!e) return "";
+                    const sign = e.trade_pnl >= 0 ? "+" : "";
+                    return [
+                      " " + (e.title || "").slice(0, 40),
+                      " Trade PnL: " + sign + "$" + e.trade_pnl.toFixed(2),
+                      " Cumulative: $" + (e.cumulative != null ? e.cumulative.toFixed(2) : "—"),
+                    ];
+                  }
+                }
+              }
+            },
+            scales: {
+              x: {
+                ticks: {
+                  color: "#8b949e",
+                  maxTicksLimit: 10,
+                  callback: (v, i) => "#" + (i + 1),
+                },
+                grid: { color: "rgba(255,255,255,0.04)" }
+              },
+              y: {
+                ticks: { color: "#8b949e", callback: v => v != null ? "$" + v.toFixed(0) : "" },
+                grid: {
+                  color: ctx => ctx.tick.value === 0
+                    ? "rgba(255,255,255,0.25)"
+                    : "rgba(255,255,255,0.06)",
+                },
+                afterDataLimits: axis => {
+                  if (axis.max < 0) axis.max = 0;
+                  if (axis.min > 0) axis.min = 0;
+                },
+              }
+            }
+          }
+        });
+      }
     } else {
-      wrEl.textContent = "—";
-      wrEl.className = "card-value dim";
-    }
-    document.getElementById("s-settled").textContent = (d.settled_count || 0) + " settled";
-
-    const pnlEl = document.getElementById("s-pnl");
-    const pnl = d.total_pnl || 0;
-    pnlEl.textContent = (pnl >= 0 ? "+" : "") + "$" + pnl.toFixed(2);
-    pnlEl.className = "card-value " + pnlClass(pnl);
-    const dp = d.daily_pnl || 0;
-    document.getElementById("s-dpnl").textContent =
-      "today: " + (dp >= 0 ? "+" : "") + "$" + dp.toFixed(2);
-
-    document.getElementById("s-open").textContent = d.open_count || 0;
-
-    // Last cycle picks
-    const picksEl = document.getElementById("swarm-picks");
-    picksEl.innerHTML = "";
-    if (!d.last_cycle_picks || d.last_cycle_picks.length === 0) {
-      picksEl.innerHTML = "<p style='color:var(--muted);padding:12px 0'>No picks this cycle.</p>";
-    } else {
-      d.last_cycle_picks.forEach((p, i) => {
-        const barW = Math.round(p.score * 120);
-        const dirClass = p.direction === "YES" ? "dir-yes" : "dir-no";
-        const whaleLine = p.whale && p.whale.has_signal
-          ? "<span class='whale-tag'>WHALE " + p.whale.direction + " " + (p.whale.strength * 100).toFixed(0) + "%</span> "
-          : "";
-        const div = document.createElement("div");
-        div.className = "pick-card";
-        div.innerHTML =
-          "<div class='pick-q'>" +
-            "<span style='margin-right:8px'>#" + (i+1) + "</span>" +
-            "<span class='" + dirClass + "'>" + p.direction + "</span>" +
-            "  &nbsp;" +
-            "<span style='display:inline-block;width:" + barW + "px' class='score-bar'></span>" +
-            "<span style='font-size:12px;color:var(--muted)'>" + p.score.toFixed(3) + "</span>" +
-            "  &nbsp;" + whaleLine +
-            escHtml(p.question) +
-          "</div>" +
-          "<div class='pick-meta'>" +
-            "<span>YES " + (p.yes_price * 100).toFixed(1) + "%</span>" +
-            "<span>vol24h $" + (p.vol_24h || 0).toLocaleString() + "</span>" +
-            "<span>" + p.yes_votes + "Y / " + p.no_votes + "N  conf " + (p.avg_conf || 0).toFixed(0) + "%</span>" +
-          "</div>";
-        picksEl.appendChild(div);
-      });
-    }
-
-    // Paper settled trades
-    const closedSec = document.getElementById("s-closed-section");
-    if (d.closed_picks && d.closed_picks.length > 0) {
-      closedSec.classList.remove("hidden");
-      const cb = document.getElementById("s-closed-body");
-      cb.innerHTML = "";
-      d.closed_picks.forEach((t, i) => {
-        const pnlV = t.pnl || 0;
-        const tr = document.createElement("tr");
-        tr.innerHTML =
-          "<td>" + (i+1) + "</td>" +
-          "<td class='title-cell' title='" + escHtml(t.question) + "'>" + escHtml(t.question) + "</td>" +
-          "<td class='" + (t.direction === "YES" ? "dir-yes" : "dir-no") + "'>" + t.direction + "</td>" +
-          "<td>" + (t.score || 0).toFixed(3) + "</td>" +
-          "<td>" + (t.entry_price || 0).toFixed(3) + "</td>" +
-          "<td>" + (t.outcome || "—") + "</td>" +
-          "<td class='" + pnlClass(pnlV) + "'>" + (pnlV >= 0 ? "+" : "") + "$" + pnlV.toFixed(2) + "</td>";
-        cb.appendChild(tr);
-      });
-    } else {
-      closedSec.classList.add("hidden");
+      spSection.classList.add("hidden");
     }
   }
 
@@ -2966,42 +1865,14 @@ _HTML = """\
     document.getElementById("countdown").textContent = countdown;
     if (countdown <= 0) {
       countdown = 5;  // refresh every 5 seconds instead of 30
-      if (_activeTab === "swarm") fetchSwarm();
-      else if (_activeTab === "arb") fetchArb();
-      else if (_activeTab === "conviction") fetchConviction();
-      else { fetchData(); fetchWallet(); }
+      fetchSwarm();
     } else {
       countdown--;
     }
   }
 
-  async function fetchData() {
-    try {
-      const res = await fetch("/api/state");
-      const data = await res.json();
-      // Also fetch 1H crypto stats
-      try {
-        const res1h = await fetch("/api/crypto-1h");
-        const data1h = await res1h.json();
-        data.crypto_1h = data1h;
-      } catch (e) {
-        console.log("Could not fetch 1H crypto data:", e.message);
-      }
-      try {
-        render(data);
-      } catch (e) {
-        var gel = document.getElementById("global-js-error");
-        if (gel) { gel.style.display = "block"; gel.textContent = "render() error: " + e.message + " — " + (e.stack || "").split("\\n")[1]; }
-      }
-    } catch (e) {
-      document.getElementById("error-box").textContent = "Failed to fetch data: " + e.message;
-      document.getElementById("error-box").classList.remove("hidden");
-    }
-  }
-
   // ── Init ──────────────────────────────────────────────────────────────────
-  fetchData();
-  fetchWallet();
+  fetchSwarm();
   setInterval(tick, 1000);
 </script>
 </body>
@@ -3040,22 +1911,8 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
     def do_GET(self):  # noqa: N802
         path = self.path.split("?")[0]
-        if path in ("/api/state", "/api/refresh"):
-            raw  = _load_raw_state()
-            resp = _build_api_response(raw)
-            self._send_json(resp)
-        elif path == "/api/crypto-1h":
-            self._send_json(_load_1h_crypto_state())
-        elif path == "/api/swarm":
+        if path == "/api/swarm":
             self._send_json(_load_swarm_state())
-        elif path == "/api/arb":
-            self._send_json(_load_arb_state())
-        elif path == "/api/conviction":
-            self._send_json(_load_conviction_state())
-        elif path == "/api/strike":
-            self._send_json(_load_strike_state())
-        elif path == "/api/wallet":
-            self._send_json(_load_wallet_state())
         elif path == "/":
             self._send_html(_HTML)
         else:

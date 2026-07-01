@@ -206,6 +206,63 @@ async def _call_model(cfg: dict, prompt: str) -> str:
         raise ValueError(f"Unknown provider: {provider}")
 
 
+# ── Market category classifier ────────────────────────────────────────────────
+# Cheap one-shot LLM classification used to drop structurally -EV categories
+# (tennis, politics) BEFORE spending RAG + a full swarm vote on them. Smarter than
+# a keyword list — generalises to new phrasings ("Sabalenka", "US-Iran ceasefire",
+# "Will X resign?") that a static keyword set would miss.
+
+_CATEGORY_CACHE: dict[str, str] = {}
+
+_CLASSIFY_PROMPT = """\
+Classify this prediction market into exactly ONE category.
+
+Question: {question}
+
+Allowed categories: tennis, politics, soccer, baseball, basketball, hockey, \
+esports, mma, golf, other
+
+Guidance:
+- tennis  = any tennis match/tournament or individual tennis player.
+- politics = elections, governments, geopolitics, war, treaties, diplomacy,
+  policy, legislation, sanctions, or a public figure's statements/actions/
+  decisions. Includes news-driven world events (ceasefires, summits, etc.).
+- Otherwise pick the best-fitting sport, or "other".
+
+Reply with ONLY the single category word in lowercase. No other text."""
+
+
+async def classify_market(market: "MarketData") -> str:
+    """
+    Return a lowercase category for the market via one cheap LLM call.
+    Cached by market id. Returns "other" on any error (fail-open: better to
+    evaluate a market than to silently drop everything if the classifier is down).
+    """
+    key = getattr(market, "id", None) or market.question
+    cached = _CATEGORY_CACHE.get(key)
+    if cached is not None:
+        return cached
+    if not ACTIVE_MODELS:
+        return "other"
+    # Prefer deepseek (cheap, the active model); fall back to whatever is active.
+    cfg = next((m for m in ACTIVE_MODELS if m["name"] == "deepseek"), ACTIVE_MODELS[0])
+    try:
+        raw = await asyncio.wait_for(
+            _call_model(cfg, _CLASSIFY_PROMPT.format(question=market.question)),
+            timeout=MODEL_TIMEOUT_S,
+        )
+        # First alpha token, lowercased — robust to stray punctuation / extra words.
+        m = re.search(r"[a-zA-Z]+", raw or "")
+        cat = m.group(0).lower() if m else "other"
+    except Exception as e:
+        log.warning("classify_market failed for %r: %s", market.question[:40], e)
+        return "other"  # fail-open, not cached → retried next cycle
+    if len(_CATEGORY_CACHE) > 3000:
+        _CATEGORY_CACHE.clear()
+    _CATEGORY_CACHE[key] = cat
+    return cat
+
+
 # ── Public: run one model on one market ──────────────────────────────────────
 
 async def ask_model(cfg: dict, market: MarketData, whale: "WhaleSignal", context: str) -> ModelVerdict:
@@ -214,7 +271,10 @@ async def ask_model(cfg: dict, market: MarketData, whale: "WhaleSignal", context
     prompt = _build_prompt(market, whale, context)
     try:
         raw = await asyncio.wait_for(_call_model(cfg, prompt), timeout=MODEL_TIMEOUT_S)
-        decision, confidence, reasoning = _parse_response(raw, name, whale.direction)
+        # whale may be None in whale-off mode; direction only affects legacy FOLLOW parsing.
+        decision, confidence, reasoning = _parse_response(
+            raw, name, whale.direction if whale else "",
+        )
         log.debug("%s → %s (%d) %s", name, decision.value, confidence, reasoning[:60])
         return ModelVerdict(
             model_name=name,

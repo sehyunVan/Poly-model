@@ -41,6 +41,7 @@ for _p in [_SRC.parent, _SRC.parent / "polymarket-mcp-main" / "polymarket-mcp-ma
 from crypto.flow import compute_signal, SIGNAL_THRESHOLD, FlowSignal
 from crypto.price_feed import get_candles, get_coinbase_price, get_mlofi, live_feed as _live_feed
 from crypto.clob_feed import clob_feed as _clob_feed
+from crypto.llm_gate import llm_gate as _llm_gate
 from crypto.deribit import get_pcr_score as _get_pcr_score
 from crypto.rtds_feed import rtds_feed as _rtds_feed
 from crypto.pairs import get_pairs_signal_cached
@@ -103,6 +104,12 @@ WALLET_SHARE = float(_CFG.get("wallet_share", 1.0))
 # E.g. [0.68–0.70] ∪ [0.72–0.76]. The losing 0.70–0.72 middle is excluded.
 MIN_CLOB_PRICE = float(_CFG.get("min_clob_price", 0.0))
 MAX_CLOB_PRICE = float(_CFG.get("max_clob_price", 1.0))
+# Per-symbol band override: {"BTC": [0.55, 0.65], "SOL": [0.50, 0.70]}
+# Overrides MIN_CLOB_PRICE / MAX_CLOB_PRICE for matching symbols only.
+SYMBOL_BANDS = {
+    str(s).upper(): (float(lo), float(hi))
+    for s, (lo, hi) in (_CFG.get("symbol_bands") or {}).items()
+}
 # Upper band score floor: when fill >= this threshold, require stronger signal.
 # Analysis of 259 settled signal_log entries in [0.80-0.90): low-score signals (<0.45)
 # have negative/marginal EV (-0.010 to +0.019), while |score|>=0.45 + trend!=UP = EV +0.079.
@@ -152,9 +159,17 @@ _LOG_FILE_NAME  = str(_CFG.get("log_file", "crypto.log"))
 _CRYPTO_CACHE   = _ROOT / "data" / str(_CFG.get("cache_file", "crypto_cache.jsonl"))  # override early definition
 
 
-def _in_clob_band(price: float) -> bool:
+def _band_for(symbol: str | None) -> tuple[float, float]:
+    """Return (lo, hi) band for symbol — per-symbol override if present, else global."""
+    if symbol and symbol.upper() in SYMBOL_BANDS:
+        return SYMBOL_BANDS[symbol.upper()]
+    return (MIN_CLOB_PRICE, MAX_CLOB_PRICE)
+
+
+def _in_clob_band(price: float, symbol: str | None = None) -> bool:
     """Return True if price falls in any accepted profitable zone."""
-    in_main  = MIN_CLOB_PRICE <= price < MAX_CLOB_PRICE
+    lo, hi = _band_for(symbol)
+    in_main  = lo <= price < hi
     in_zone2 = CLOB_ZONE2_MIN <= price < CLOB_ZONE2_MAX and CLOB_ZONE2_MAX > CLOB_ZONE2_MIN
     return in_main or in_zone2
 # Session filter: only enter positions during proven profitable UTC hours.
@@ -761,6 +776,8 @@ def _log_signal(
     mom_30s: "float | None" = None,
     whale_notional: float = 0.0,
     whale_is_buy: "bool | None" = None,
+    llm_direction: "str | None" = None,
+    llm_agrees: "bool | None" = None,
 ) -> None:
     """
     Append every fired signal to signal_log.jsonl — whether executed or skipped.
@@ -773,7 +790,7 @@ def _log_signal(
         "symbol":         symbol,
         "timestamp":      datetime.now(timezone.utc).isoformat(),
         "signal_dir":     signal_dir,
-        "clob_ask":       round(clob_ask, 4),
+        "clob_ask":       round(clob_ask, 4) if clob_ask is not None else None,
         "gamma_price":    round(gamma_price, 4),
         "score":          round(score, 4),
         "price_drift":    round(price_drift, 4),
@@ -792,6 +809,9 @@ def _log_signal(
         "outcome_up":     None,
         "won":            None,
         "pnl":            None,
+        # LLM gate fields (ghost data — for post-hoc WR analysis by agreement)
+        "llm_direction":  llm_direction,
+        "llm_agrees":     llm_agrees,
     }
     try:
         with open(_SIGNAL_LOG, "a", encoding="utf-8") as f:
@@ -895,7 +915,7 @@ def _settle_signal_log(log: logging.Logger, max_per_call: int = 40) -> None:
         won = (signal_dir == "YES" and outcome_up) or \
               (signal_dir == "NO"  and not outcome_up)
 
-        clob_ask = r.get("clob_ask", 0.0)
+        clob_ask = r.get("clob_ask") or 0.0
         stake    = r.get("stake", 0.0)
         if clob_ask > 0 and stake > 0:
             pnl = round(stake * (1.0 / clob_ask - 1.0) if won else -stake, 4)
@@ -1483,6 +1503,29 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
     _rtds_feed.start()
     log.info("Polymarket RTDS feed started (Binance relay + Chainlink oracle)")
 
+    # ── Start LLM direction gate ───────────────────────────────────────────────
+    # Background daemon: calls DeepSeek + GPT-4o-mini every 60s, caches direction
+    # per symbol. Ghost mode by default (logs but never blocks trades).
+    _llm_gate_enabled  = _CFG.get("llm_gate_enabled", False)
+    _llm_gate_min_conf = _CFG.get("llm_gate_min_conf", 55)
+    _llm_models = []
+    for _name, _key_var, _model_id, _base_url in [
+        ("deepseek",    "DEEPSEEK_API_KEY", "deepseek-chat",  "https://api.deepseek.com/v1"),
+        ("gpt-4o-mini", "OPENAI_API_KEY",   "gpt-4o-mini",   "https://api.openai.com/v1"),
+    ]:
+        _key = os.getenv(_name.upper().replace("-", "_") + "_API_KEY") or os.getenv(_key_var)
+        if _key:
+            _llm_models.append({"name": _name, "api_key": _key,
+                                 "model": _model_id, "base_url": _base_url})
+    if len(_llm_models) >= 2:
+        _llm_gate.start(_llm_models, symbols=list(_CFG.get("active_symbols", ["BTC"])),
+                        refresh_interval=_CFG.get("llm_gate_interval", 60))
+        log.info("LLM gate started | mode=%s models=%s",
+                 "GATE" if _llm_gate_enabled else "GHOST",
+                 [m["name"] for m in _llm_models])
+    else:
+        log.info("LLM gate disabled (need 2+ model keys, got %d)", len(_llm_models))
+
     # ── Start Binance liquidation cascade detector ─────────────────────────────
     # Subscribes to wss://fstream.binance.com/ws/!forceOrder@arr (no auth needed).
     # Daemon thread — does not block the main loop. Signal available immediately
@@ -1805,8 +1848,11 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
             # if symbol == "SOL" and _hr in SOL_HOUR_BLOCK:  [DISABLED — sol_hour_block is []]
             #     log.info(...); continue
 
-            # ★ Active symbol filter — ENABLED FOR ALL 2026-04-27.
-            # ACTIVE_SYMBOLS=[BTC, ETH, SOL]. All symbols trade.
+            # ★ Active symbol filter — drop trades for symbols not in active list.
+            # Yaml `active_symbols: [BTC, SOL]` excludes ETH entirely.
+            if symbol not in ACTIVE_SYMBOLS:
+                continue
+
             if any(p.market_id == market_id for p in vp.positions
                    if p.category == "crypto"):
                 continue
@@ -2010,9 +2056,19 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
             # crowd conviction via fill price, Gamma price near 0.5 is just lag.
 
             # ── 15-minute spot trend filter ────────────────────────────────────────────
+            # 2026-05-28: relaxed from "block all non-NEUTRAL" to "block only
+            # directional MISMATCH". The strict version eliminated all trades
+            # during sustained 15m directional moves (e.g., 1.5h of zero trades
+            # observed after live restart). With-trend trades at our [0.50-0.65]
+            # band are still positive-EV at ~61-65% WR. mom_align gate below
+            # still provides the 30s direction check as a second layer.
             spot_trend = _get_spot_trend(symbol, log)
-            if SPOT_TREND_FILTER and spot_trend != "NEUTRAL":
-                log.info("TREND FILTER  %s  %s  trend=%s — skip", symbol, slug[-16:], spot_trend)
+            if SPOT_TREND_FILTER and (
+                (sig.direction == "UP"   and spot_trend == "DOWN") or
+                (sig.direction == "DOWN" and spot_trend == "UP")
+            ):
+                log.info("TREND FILTER  %s  %s  signal=%s vs trend=%s — mismatch, skip",
+                         symbol, slug[-16:], sig.direction, spot_trend)
                 continue
 
             # ── mom_30s directional alignment gate (2026-05-09) ──────────────
@@ -2044,16 +2100,51 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
             # if BINANCE_1M_CONFIRM_PCT > 0:  [DISABLED — threshold is 0.0]
             #     ... confirmation check [DISABLED]
 
+            # ── LLM direction gate ────────────────────────────────────────────
+            # Reads cached result from _llm_gate (background thread, refreshes
+            # every llm_gate_interval seconds).
+            # Ghost mode (default): logs agreement but never blocks.
+            # Gate mode (llm_gate_enabled=true): skips when both LLMs oppose flow.
+            _llm_dir, _llm_conf = _llm_gate.get_signal(symbol, max_age_s=120)
+            _llm_agrees = (_llm_dir == sig.direction) if _llm_dir is not None else None
+            if _llm_dir is not None:
+                _agree_str = "AGREE" if _llm_agrees else "DISAGREE"
+                log.info("LLM gate %s  %s  flow=%s llm=%s conf=%d",
+                         _agree_str, slug[-16:], sig.direction, _llm_dir, _llm_conf)
+                if _llm_gate_enabled and not _llm_agrees and _llm_conf >= _llm_gate_min_conf:
+                    log.info("LLM GATE SKIP  %s  %s  flow=%s vs llm=%s(c%d)",
+                             symbol, slug[-16:], sig.direction, _llm_dir, _llm_conf)
+                    _log_signal(
+                        # clob_ask is fetched later (line ~2153); the LLM gate
+                        # fires before the CLOB price is known, so log 0.0 here
+                        # (matches the market_price guard on the line below).
+                        market_id, slug, symbol, sig.direction, 0.0,
+                        executed=False, skip_reason="llm_gate",
+                        score=sig.score, price_drift=sig.price_drift,
+                        ob_imbalance=sig.ob_imbalance, alpha=sig.alpha,
+                        window_elapsed=window_elapsed, spot_trend=spot_trend,
+                        gamma_price=market_price if "market_price" in dir() else 0.0,
+                        stake=0.0, log=log,
+                        mom_30s=mom_30s, whale_notional=whale_notional,
+                        whale_is_buy=whale_is_buy,
+                        llm_direction=_llm_dir, llm_agrees=_llm_agrees,
+                    )
+                    continue
+
             # ── YES direction — ENABLED 2026-04-27 filter removal test ────────
             # Allow UP (YES) bets. Historical analysis blocked these, but
             # enable to test if signal quality without filters is better.
 
             is_up        = sig.direction == "UP"
             market_price = current_price if is_up else (1.0 - current_price)
-            bet_size     = _size_bet(sig.score, market_price, vp.available_usdc)
+            # 2026-05-28: Flat MAX_BET_ABS sizing (was Kelly via _size_bet).
+            # Kelly was scaling strong signals (score>0.9) down to <$1, blocking
+            # all entries against the $5 floor. Paper validation showed +EV at
+            # uniform $1 bet, so flat sizing should preserve and scale that edge.
+            bet_size     = min(MAX_BET_ABS, vp.available_usdc)
 
             if bet_size < MIN_BET_ABS:
-                log.info("Bet too small (%.2f) — skip", bet_size)
+                log.info("Bet too small (%.2f) — wallet drained, skip", bet_size)
                 continue
 
             # ── Spread measurement ────────────────────────────────────────
@@ -2118,7 +2209,7 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
                             symbol, slug[-16:], clob_ask, FADE_BAND_MIN, FADE_BAND_MAX,
                         )
                         continue
-                elif not _in_clob_band(clob_ask):
+                elif not _in_clob_band(clob_ask, symbol):
                     _signal_dir_label = "YES" if is_up else "NO"
                     if GHOST_BAND_MIN <= clob_ask < MIN_CLOB_PRICE:
                         _log_ghost_trade(
@@ -2138,9 +2229,10 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
                             window_elapsed=window_elapsed, spot_trend=spot_trend,
                             gamma_price=market_price,
                         )
+                    _band_lo, _band_hi = _band_for(symbol)
                     log.info(
                         "BAND SKIP  %s  %s  fill=%.4f  band=[%.2f–%.2f]",
-                        symbol, slug[-16:], clob_ask, MIN_CLOB_PRICE, MAX_CLOB_PRICE,
+                        symbol, slug[-16:], clob_ask, _band_lo, _band_hi,
                     )
                     continue
             else:
@@ -2184,17 +2276,14 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
             # if UPPER_BAND_MIN_SCORE > 0.0 and clob_ask >= UPPER_BAND_START:  [DISABLED]
             #     ... skip logic [DISABLED]
 
-            # Recompute bet_size now that clob_ask is confirmed, applying the
-            # inverse-fill discount. The initial estimate (line ~1789) used
-            # market_price (Gamma) because CLOB fill wasn't known yet.
-            bet_size = _size_bet(sig.score, market_price, vp.available_usdc,
-                                 fill_price=clob_ask)
-            # Fade trades: hard cap at FADE_MAX_BET_ABS regardless of Kelly —
-            # contrarian small bet, asymmetric payout already provides upside.
+            # 2026-05-28: Flat-sizing override — keep bet_size at MAX_BET_ABS
+            # (set above at line ~2074). Kelly's inverse-fill discount was
+            # cutting strong signals to <$1, killing all entries against the
+            # $5 floor. Fade path still hard-caps if triggered.
             if fade_triggered:
                 bet_size = min(bet_size, FADE_MAX_BET_ABS)
             if bet_size < MIN_BET_ABS:
-                log.info("Bet too small after fill discount (%.2f) — skip", bet_size)
+                log.info("Bet too small after fill discount (%.2f) — wallet drained, skip", bet_size)
                 continue
 
             # ── ML entry filter ────────────────────────────────────────────
@@ -2218,12 +2307,10 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
                         )
                         continue
                     log.info("ML_EV PASS  %s  %s  epnl=%.3f", symbol, slug[-16:], _pred_epnl)
-                    # Recompute bet using EV-based Kelly (fill baked in, skips inverse-fill discount)
-                    bet_size = _size_bet(sig.score, market_price, vp.available_usdc,
-                                         fill_price=clob_ask, pred_epnl=_pred_epnl)
-                    if bet_size < MIN_BET_ABS:
-                        log.info("Bet too small after EV sizing (%.2f) — skip", bet_size)
-                        continue
+                    # 2026-05-28: Flat-sizing override — keep bet_size at MAX_BET_ABS
+                    # set earlier. EV-based Kelly was scaling bets to fractions of a
+                    # dollar even when ML strongly approved. Flat $5 is simpler and
+                    # paper-validated.
                 elif not _ml_is_epnl and ML_FILTER_THRESHOLD > 0.0:
                     _prob = float(_ML_FILTER["model"].predict_proba([_fv])[0][1])
                     if _prob < ML_FILTER_THRESHOLD:
@@ -2406,6 +2493,7 @@ def run(log: logging.Logger, backend: "ExecutionBackend | None" = None):
                 gamma_price=market_price, stake=actual_bet_size, log=log,
                 mom_30s=mom_30s, whale_notional=whale_notional,
                 whale_is_buy=whale_is_buy,
+                llm_direction=_llm_dir, llm_agrees=_llm_agrees,
             )
 
             log.info(

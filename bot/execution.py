@@ -27,10 +27,38 @@ log = logging.getLogger(__name__)
 CLOB_HOST           = os.getenv("CLOB_HOST", "https://clob.polymarket.com")
 EXEC_MIN_SCORE      = 0.60
 EXEC_MIN_UNANIMOUS  = False  # ★ relaxed True→False (2026-05-14): paper-only NO with 1 YES dissenter = 17 trades, 94.1% WR, +$30 real PnL; dissent is not a quality warning
-EXEC_FLAT_BET       = 20.0  # target bet — API cost per trade ~$0.05-0.10; needs $20+ to be cost-positive
+EXEC_FLAT_BET       = 100.0 # target bet — raised $80→$100 on 2026-06-26 (user). NOTE: still capped at balance×0.35 below, so $100 only BINDS while balance ≥ ~$286; at the current ~$200-280 liquid the effective bet is the 0.35 cap (~$70-98), so this mostly matters once the wallet grows. Revert to 80.0 if WR drops below ~78% over 50+ trades.
 EXEC_MIN_BET        = 10.0  # floor — don't trade below $10 (too small vs API cost)
 EXEC_MIN_TOKENS     = 5.0   # Polymarket CLOB minimum token count per order
 _CLOB_TIMEOUT_S     = 15
+
+# ── Payout-proportional sizing (2026-06-11) — CURRENTLY INACTIVE ──────────────
+# Superseded same day by the engine-zone-only gate in execute_pick() (we now
+# restrict to [0.70, 0.78) and bet flat max, rather than trading all bands at
+# scaled size). Function kept for one-line reversal if the band is ever widened.
+# 14d audit (159 settled NO trades, +$432, 86.8% WR) showed profit is wildly
+# concentrated by NO ask = payout size:
+#   [0.70-0.75) 93.5% WR +34.4% ROI  -> 62% of all profit from 19% of trades
+#   [0.75-0.85) ~0% ROI (dead capital)
+#   [0.85-0.95) 100% WR but +5-14% ROI, thin payout, fragile small-sample
+# Flat $40 sizing bet the same on a fat 0.72 NO as a thin 0.95 NO. Kelly says
+# the opposite: at ask>=0.92 net odds are <0.09, so optimal stake collapses even
+# at high WR (and one loss wipes >11 wins). We now scale bet by net-odds ratio
+# vs an anchor at 0.78 (the top of the engine zone), clamped to [floor, 1.0].
+# This is ~quarter-Kelly given the roughly-flat ~85% WR across bands, and a
+# monotone-decreasing-in-ask curve faithful to both observed hypotheses
+# (cheap NO = fat edge = bet big; expensive NO = thin profit = bet small).
+# Reversal: set _SIZE_MULT_FLOOR = 1.0 to restore flat sizing.
+_SIZE_ANCHOR_ASK    = 0.78   # asks <= this get full size
+_SIZE_MULT_FLOOR    = 0.25   # smallest multiplier (× base $40 = $10 min bet)
+
+
+def _payout_size_mult(ask: float) -> float:
+    """Bet multiplier in [_SIZE_MULT_FLOOR, 1.0]: full size for fat-payout cheap
+    NO, shrinking as ask rises and the NO payout thins out."""
+    net = (1.0 - ask) / ask
+    ref = (1.0 - _SIZE_ANCHOR_ASK) / _SIZE_ANCHOR_ASK
+    return max(_SIZE_MULT_FLOOR, min(1.0, net / ref))
 
 # Maker mode: try a limit order inside the spread before lifting the ask.
 # Swarm markets are 24h+ so there is no time pressure — we can wait 5 minutes.
@@ -238,14 +266,26 @@ async def execute_pick(pick, reentry_info: Optional[dict] = None) -> Optional[di
         log.warning("No ask price for token %s", token_id[:12])
         return None
 
-    # NO ask floor: [0.60–0.65) confirmed -EV (61.9% WR, -$14.21 on 21 trades).
+    # ── ENGINE-ZONE gate (floor 0.65 since 06-14; ceiling 0.92→0.85 on 2026-06-26) ──
+    # Active band: [0.65, 0.85).
+    # CEILING history: 0.95→0.78 (06-11) → 0.78→0.92 (06-15, for volume) → 0.92→0.85
+    # (06-26, TRIPWIRE FIRED). The 06-15 re-open assumed [0.85,0.92) was the strongest
+    # zone (+$9.02 EV/trade in that window), but it was fragile survivorship and reverted:
+    # over 06-16→06-26 (n=43) [0.85,0.92) ran 86% WR / −$36 / −$0.84 EV — breaching the
+    # pre-committed "WR<88% → pull ceiling" rule. At ask 0.85–0.92 breakeven WR ≈ ask, so
+    # 86% tips net-negative and a cluster of favorite-upsets drained it fast.
+    # Pulled to 0.85, NOT 0.78, because the fresh data shows [0.78,0.85) is now one of the
+    # BEST zones (n=33, 88% WR, +$175, +$5.31 EV) — keep it. Zones kept (since 06-16):
+    #   [0.65,0.78) 77% WR +$386 +$6.90 EV  ·  [0.78,0.85) 88% WR +$175 +$5.31 EV
+    # Zone cut: [0.85,0.92) −$36 −$0.84 EV.
+    # Reversal: ceiling 0.92 (re-open high-ask) or 0.78 (engine-core only).
     if ask < 0.65:
-        log.info("SKIP NO-ask-floor: ask=%.3f < 0.65  %s", ask, market.question[:60])
+        log.info("SKIP engine-floor: ask=%.3f < 0.65 (below engine zone)  %s", ask, market.question[:55])
+        ghost.record_ghost(pick, ask)   # ghost-track: does it rise into the zone?
         return None
-
-    # NO ask ceiling: above 0.95 the payout is too thin to cover fee.
-    if ask > 0.95:
-        log.info("SKIP NO-ask-ceiling: ask=%.3f > 0.95  %s", ask, market.question[:60])
+    if ask >= 0.85:
+        log.info("SKIP engine-ceiling: ask=%.3f >= 0.85 (payout too thin / weak cushion)  %s", ask, market.question[:55])
+        ghost.record_ghost(pick, ask)   # ghost-track: does it fall into the zone? (adverse)
         return None
 
     # Safety: CLOB/Gamma divergence guard for YES bets only.
@@ -280,7 +320,10 @@ async def execute_pick(pick, reentry_info: Optional[dict] = None) -> Optional[di
         log.warning("Balance $%.2f below min bet $%.2f", balance, EXEC_MIN_BET)
         return None
 
-    # Flat bet: mirrors paper tracker (SIMULATED_BET = $10), capped at 35% of swarm budget.
+    # Flat max bet inside the engine zone (capped at 35% of swarm budget). With
+    # the band already gated to [0.70, 0.78), payout is uniformly fat — no need
+    # to scale by ask, so we bet max on every qualifying pick. (_payout_size_mult
+    # is retained but unused; re-enable it if the band is ever widened again.)
     bet  = min(EXEC_FLAT_BET, balance * 0.35)
     bet  = max(EXEC_MIN_BET, bet)
     size = math.ceil(bet / ask * 10000) / 10000

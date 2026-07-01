@@ -25,10 +25,11 @@ from bot.config import ACTIVE_MODELS, CONSENSUS_TOP_N, CYCLE_SECONDS
 from bot.data.filter import apply_filters
 from bot.data.markets import fetch_markets
 from bot.data.whale import whale_feed
-from bot.execution import EXEC_MIN_SCORE, execute_pick
+from bot.execution import EXEC_MIN_SCORE, execute_pick, _get_balance_sync
 from bot.paper import flush_state, record_picks, record_real_execution
+from bot import ar, ghost
 from bot.paper_mirror import record_paper_mirror
-from bot.swarm.consensus import AI_AGREE_MIN, EXEC_SCORE_MIN, MarketConsensus, run_swarm
+from bot.swarm.consensus import AI_AGREE_MIN, EXEC_SCORE_MIN, MarketConsensus, run_swarm, REQUIRE_WHALE
 
 # Force UTF-8 stdout on Windows (Korean locale uses cp949 by default)
 if hasattr(sys.stdout, "reconfigure"):
@@ -49,10 +50,18 @@ _REENTRY_MIN_S    = 45 * 60  # minimum seconds between first and second entry on
 _REENTRY_MAX_COUNT = 2       # max total entries per market within TTL window
 
 # Markets where execution was declined this session (YES blocked, NO ask > ceiling, etc.)
-# Prevents re-running expensive synthesis every cycle for the same unexecutable market.
-# In-memory only — intentionally short-lived so a market can retry next session if conditions change.
+# Short cooloff only — the swarm RE-VOTES every candidate each cycle, so the agent
+# already produces a fresh answer as time passes; this just throttles how often we
+# re-ATTEMPT execution on a market that was conviction-good but declined at the
+# execution stage (most commonly an out-of-band ask). The NO ask moves minute-to-
+# minute, and the ghost log shows out-of-band picks frequently drift INTO [0.65,0.78)
+# later — so we want to re-check soon, not sit out 2h. 20 min balances "catch the
+# ask moving into band" against not hammering the deepseek vote every 5 min.
+# (2026-06-14: lowered 2h → 20m so passed-over positions get re-evaluated as the
+# user requested. Once executed, swarm_executed.json's 48h/max-2-entries guard still
+# prevents over-betting, so a shorter cooloff cannot cause runaway re-entry.)
 _DECLINED: dict[str, float] = {}   # market_id → monotonic time of decline
-_DECLINED_TTL_S = 2 * 3600         # 2 hours
+_DECLINED_TTL_S = 20 * 60          # 20 minutes
 
 # Question-level dedup: prevents betting the same matchup twice in consecutive days when they share
 # the same question text but different market IDs (e.g. "Nationals vs Pirates" Apr 15 and Apr 16).
@@ -258,13 +267,19 @@ async def run_cycle(cycle: int, executed_records: dict[str, dict]) -> None:
 
         gate_score = pick.score >= EXEC_SCORE_MIN
         gate_agree = pick.ai_agree_frac >= AI_AGREE_MIN
-        gate_whale = pick.whale and pick.whale.has_signal
+        # Whale is required only when REQUIRE_WHALE is on; in whale-off mode the model
+        # majority already set the direction, so no whale signal is needed to execute.
+        gate_whale = (not REQUIRE_WHALE) or bool(pick.whale and pick.whale.has_signal)
         if gate_score and gate_agree and gate_whale:
             action = "RE-ENTRY" if reentry_info else "EXECUTING"
+            whale_desc = (
+                f"{pick.whale.direction}({pick.whale.strength:.2f})"
+                if pick.whale else "no-whale"
+            )
             log.info(
-                "%s: %s  score=%.3f  agree=%.0f%%  whale=%s(%.2f)  %s",
+                "%s: %s  score=%.3f  agree=%.0f%%  whale=%s  %s",
                 action, pick.direction.value, pick.score, pick.ai_agree_frac * 100,
-                pick.whale.direction, pick.whale.strength, pick.market.question[:50],
+                whale_desc, pick.market.question[:50],
             )
             fill = await execute_pick(pick, reentry_info=reentry_info)
             if fill:
@@ -290,7 +305,10 @@ async def run_cycle(cycle: int, executed_records: dict[str, dict]) -> None:
                 pick.market.question[:50],
             )
 
-    # 7. Write swarm_state.json AFTER both paper tracking and real execution
+    # 7. Update the ghost log: snapshot ask trajectory + settle out-of-band picks.
+    await ghost.update_ghosts()
+
+    # 8. Write swarm_state.json AFTER both paper tracking and real execution
     # flush_state loads paper trades fresh from disk so real trades are always included
     flush_state(picks)
 
@@ -320,6 +338,18 @@ async def main() -> None:
     while True:
         cycle += 1
         t0 = time.monotonic()
+
+        # Balance-threshold auto-redemption (re-homed from the halted crypto loop).
+        # When the liquid balance falls below $50, sweep CTF wins → cash so the
+        # swarm doesn't starve. Rate-limited internally (AR_COOLDOWN). Runs before
+        # the cycle so any freed funds are available for this cycle's sizing.
+        try:
+            loop_ = asyncio.get_event_loop()
+            bal   = await loop_.run_in_executor(None, _get_balance_sync)
+            ar.maybe_redeem(bal, log)
+        except Exception as e:
+            log.warning("AR balance check failed: %s", e)
+
         try:
             await run_cycle(cycle, _executed_records)
         except Exception as e:
